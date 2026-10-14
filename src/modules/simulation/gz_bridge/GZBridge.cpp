@@ -396,12 +396,11 @@ void GZBridge::magnetometerCallback(const gz::msgs::Magnetometer &msg)
 	report.device_id = id.devid;
 	report.temperature = this->_temperature;
 
-	// FIMEX: once we're on jetty or later
-	// The magnetometer plugin publishes in units of gauss and in a weird left handed coordinate system
-	// https://github.com/gazebosim/gz-sim/pull/2460
-	report.x = -msg.field_tesla().y();
-	report.y = -msg.field_tesla().x();
-	report.z = msg.field_tesla().z();
+	// The magnetometer system is configured in server.config to use an ENU world field and units of gauss
+	// (https://github.com/gazebosim/gz-sim/pull/2460), the measurement is in the sensor frame (FLU): convert to FRD
+	report.x = msg.field_tesla().x();
+	report.y = -msg.field_tesla().y();
+	report.z = -msg.field_tesla().z();
 
 	_sensor_mag_pub.publish(report);
 }
