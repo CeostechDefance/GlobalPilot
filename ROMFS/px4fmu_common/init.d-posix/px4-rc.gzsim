@@ -45,13 +45,25 @@ if [ -z "${PX4_GZ_STANDALONE}" ]; then
 			. ../gz_env.sh
 		fi
 
-		echo "INFO  [init] Starting gazebo with world: ${PX4_GZ_WORLDS}/${PX4_GZ_WORLD}.sdf"
+		# Gerçek arazili dünyalar ayrı klasörde ve kendi GUI yapılandırmalarıyla gelir
+		gz_world_file="${PX4_GZ_WORLDS}/${PX4_GZ_WORLD}.sdf"
+		gz_gui_args=""
+		if [ ! -f "${gz_world_file}" ] && [ -n "${PX4_GZ_GEO_WORLDS}" ] && [ -f "${PX4_GZ_GEO_WORLDS}/${PX4_GZ_WORLD}.sdf" ]; then
+			gz_world_file="${PX4_GZ_GEO_WORLDS}/${PX4_GZ_WORLD}.sdf"
+			gz_gui_args="--gui-config ${PX4_GZ_GEO_GUI_CONFIG}"
+			if [ -z "${PX4_GZ_GEO_PLUGINS}" ]; then
+				echo "WARN  [init] gz_geo_terrain plugins not built (g++-12 required), terrain will be missing"
+			fi
+		fi
 
-		${gz_command} ${gz_sub_command} --verbose=${GZ_VERBOSE:=1} -r -s "${PX4_GZ_WORLDS}/${PX4_GZ_WORLD}.sdf" &
+		echo "INFO  [init] Starting gazebo with world: ${gz_world_file}"
+
+		${gz_command} ${gz_sub_command} --verbose=${GZ_VERBOSE:=1} -r -s "${gz_world_file}" &
 
 		if [ -z "${HEADLESS}" ]; then
 			echo "INFO  [init] Starting gz gui"
-			${gz_command} ${gz_sub_command} -g > /dev/null 2>&1 &
+			# shellcheck disable=SC2086
+			${gz_command} ${gz_sub_command} -g ${gz_gui_args} > /dev/null 2>&1 &
 		fi
 
 	else

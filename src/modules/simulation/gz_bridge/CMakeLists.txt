@@ -38,6 +38,9 @@ else()
 endif()
 
 file(GLOB gz_worlds ${PX4_SOURCE_DIR}/Tools/simulation/gz/worlds/*.sdf)
+# Gerçek arazili dünyalar (Tools/simulation/gz_geo_terrain submodule'ü)
+file(GLOB gz_geo_worlds ${PX4_SOURCE_DIR}/Tools/simulation/gz_geo_terrain/worlds/*.sdf)
+list(APPEND gz_worlds ${gz_geo_worlds})
 file(GLOB gz_airframes ${PX4_SOURCE_DIR}/ROMFS/px4fmu_common/init.d-posix/airframes/*_gz_*)
 
 if (gz-transport_FOUND)
@@ -91,6 +94,22 @@ if (gz-transport_FOUND)
 		EXCLUDE_FROM_ALL true
 	)
 
+	# Gerçek arazi eklentileri (sunucu + GUI). Karo motoru ilk derlemede ~/.cache/gz-geo-terrain
+	# altına bir kez derlenir; g++-12 yoksa atlanır ve arazili dünyalar çalıştırılamaz.
+	find_program(GZ_GEO_TERRAIN_CXX g++-12)
+	option(GZ_GEO_TERRAIN "Build Gazebo geo terrain plugins" ON)
+	if(GZ_GEO_TERRAIN AND GZ_GEO_TERRAIN_CXX)
+		px4_add_git_submodule(TARGET git_gz_geo_terrain PATH "${PX4_SOURCE_DIR}/Tools/simulation/gz_geo_terrain")
+		add_custom_target(gz_geo_terrain ALL
+			COMMAND ${PX4_SOURCE_DIR}/Tools/simulation/gz_geo_terrain/scripts/build.sh --build-dir ${PX4_BINARY_DIR}/gz_geo_terrain
+			DEPENDS git_gz_geo_terrain
+			USES_TERMINAL
+		)
+		set(GZ_GEO_TERRAIN_PLUGINS ${PX4_BINARY_DIR}/gz_geo_terrain/plugin)
+	elseif(gz_geo_worlds)
+		message(STATUS "gz_geo_terrain disabled (requires g++-12)")
+	endif()
+
 	# Below we setup the build targets for our worlds and models
 	# Syntax: gz_<model_name>_<world_name>
 	# Example: gz_x500_flow_forest
@@ -115,6 +134,9 @@ if (gz-transport_FOUND)
 					USES_TERMINAL
 					DEPENDS px4 px4_gz_plugins
 				)
+				if(world IN_LIST gz_geo_worlds AND TARGET gz_geo_terrain)
+					add_dependencies(gz_${model_name}_${world_name} gz_geo_terrain)
+				endif()
 			endif()
 		endforeach()
 	endforeach()
