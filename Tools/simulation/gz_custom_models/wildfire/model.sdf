@@ -1,0 +1,63 @@
+<?xml version="1.0"?>
+<!--
+  A wildfire of about 60 x 60 m: flames at the ground, dark smoke near the fire and a pale column above.
+  Colours come from the textures, because Ogre2 ignores the emitter colour range.
+  The emitters send particles along their +X axis, so each one is pitched up. Smoke leans about 15 degrees
+  towards +X of the model; yaw the model to change the drift direction.
+
+  Stop or change it at run time, for example:
+    gz topic -t /model/wildfire/link/fire_link/particle_emitter/flames/cmd -m gz.msgs.ParticleEmitter -p 'emitting: {data: false}'
+-->
+<sdf version="1.9">
+  <model name="wildfire">
+    <static>true</static>
+    <plugin filename="gz-sim-particle-emitter-system" name="gz::sim::systems::ParticleEmitter"/>
+    <link name="fire_link">
+      <particle_emitter name="flames" type="box">
+        <pose>0 0 2 0 -1.5708 0</pose>
+        <emitting>true</emitting>
+        <size>2 60 60</size>
+        <particle_size>9 9 9</particle_size>
+        <lifetime>2.5</lifetime>
+        <min_velocity>3</min_velocity>
+        <max_velocity>8</max_velocity>
+        <scale_rate>0</scale_rate>
+        <rate>90</rate>
+        <material>
+          <diffuse>1 1 1</diffuse>
+          <pbr><metal><albedo_map>model://wildfire/materials/textures/flame.png</albedo_map></metal></pbr>
+        </material>
+      </particle_emitter>
+      <particle_emitter name="dark_smoke" type="box">
+        <pose>0 0 12 0 -1.31 0</pose>
+        <emitting>true</emitting>
+        <size>4 50 50</size>
+        <particle_size>18 18 18</particle_size>
+        <lifetime>20</lifetime>
+        <min_velocity>3</min_velocity>
+        <max_velocity>10</max_velocity>
+        <scale_rate>3</scale_rate>
+        <rate>16</rate>
+        <material>
+          <diffuse>1 1 1</diffuse>
+          <pbr><metal><albedo_map>model://wildfire/materials/textures/smoke_dark.png</albedo_map></metal></pbr>
+        </material>
+      </particle_emitter>
+      <particle_emitter name="smoke_column" type="box">
+        <pose>0 0 60 0 -1.31 0</pose>
+        <emitting>true</emitting>
+        <size>6 60 60</size>
+        <particle_size>35 35 35</particle_size>
+        <lifetime>70</lifetime>
+        <min_velocity>2</min_velocity>
+        <max_velocity>9</max_velocity>
+        <scale_rate>3</scale_rate>
+        <rate>10</rate>
+        <material>
+          <diffuse>1 1 1</diffuse>
+          <pbr><metal><albedo_map>model://wildfire/materials/textures/smoke_pale.png</albedo_map></metal></pbr>
+        </material>
+      </particle_emitter>
+    </link>
+  </model>
+</sdf>

@@ -160,6 +160,15 @@ if [ -n "${PX4_SIM_MODEL#*gz_}" ] && [ -z "${PX4_GZ_MODEL_NAME}" ]; then
 	# Wait for model to spawn
 	sleep 1
 
+	# Optional scene objects that belong to this world and aircraft, such as a test fire
+	gz_scenario="${PX4_GZ_CUSTOM_MODELS}/scenarios/${PX4_GZ_WORLD}_${MODEL_NAME}.sdf"
+	if [ -f "${gz_scenario}" ] && [ "${px4_instance}" = "0" ]; then
+		echo "INFO  [init] Spawning scenario: ${gz_scenario}"
+		${gz_command} service -s "/world/${PX4_GZ_WORLD}/create" --reqtype gz.msgs.EntityFactory \
+				--reptype gz.msgs.Boolean --timeout 5000 \
+				--req "sdf_filename: \"${gz_scenario}\", allow_renaming: true" > /dev/null 2>&1
+	fi
+
 	# Start gz_bridge
 	if ! gz_bridge start -w "${PX4_GZ_WORLD}" -n "${MODEL_NAME_INSTANCE}"; then
 		echo "ERROR [init] gz_bridge failed to start and spawn model"

@@ -63,6 +63,16 @@ The window and the camera body are not in the image, because they lie closer tha
 The camera is an ordinary visible-light sensor. There is no thermal band and no fire in the worlds, so
 detection itself cannot be tested yet.
 
+### Test fire
+
+`make px4_sitl gz_gasi_ffa_antalya` also spawns the `wildfire` model from
+`scenarios/antalya_gasi_ffa.sdf`, in forest at 36.9759 N, 30.6779 E (about 14 km north-west of the
+runway, ground 281 m). To move it, run `python3 place_wildfire.py <lat> <lon>`; delete the scenario file to
+fly without it.
+
+It is 60 x 60 m of flames with a dark and a pale smoke layer, made of Gazebo particles. Only the look is
+simulated: no heat, no spreading, no wind and no effect from water. The smoke leans a fixed 15° towards east.
+
 ### Not modelled
 
 
