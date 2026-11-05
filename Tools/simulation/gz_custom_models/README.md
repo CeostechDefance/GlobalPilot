@@ -59,6 +59,10 @@ and rising smoke stay in frame.
 Image topic: `/world/<world>/model/gasi_ffa_0/link/base_link/sensor/fire_camera/image`. In the Gazebo
 window, add the Image Display plugin and pick this topic.
 
+On terrain worlds the camera is also streamed as RTP/H.264 to UDP port 5600. In QGroundControl, set
+Application Settings > General > Video Source to "UDP h.264 Video Stream". To send it to another computer,
+start with `PX4_VIDEO_HOST_IP=<address>`; `PX4_GZ_VIDEO_STREAM=0` turns the stream off.
+
 The window and the camera body are not in the image, because they lie closer than the near clip plane.
 The camera is an ordinary visible-light sensor. There is no thermal band and no fire in the worlds, so
 detection itself cannot be tested yet.

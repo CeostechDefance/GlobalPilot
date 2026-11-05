@@ -169,6 +169,15 @@ if [ -n "${PX4_SIM_MODEL#*gz_}" ] && [ -z "${PX4_GZ_MODEL_NAME}" ]; then
 				--req "sdf_filename: \"${gz_scenario}\", allow_renaming: true" > /dev/null 2>&1
 	fi
 
+	# Terrain worlds list their own systems, so GstCameraSystem from server.config is not loaded there.
+	# It streams the first camera as RTP/H.264 to UDP port 5600 (entity 1 is the world).
+	if [ "${PX4_GZ_VIDEO_STREAM}" = "1" ] && [ "${px4_instance}" = "0" ] && [ -f "${PX4_GZ_GEO_WORLDS}/${PX4_GZ_WORLD}.sdf" ]; then
+		echo "INFO  [init] Starting camera video stream on UDP port 5600"
+		${gz_command} service -s "/world/${PX4_GZ_WORLD}/entity/system/add" --reqtype gz.msgs.EntityPlugin_V \
+				--reptype gz.msgs.Boolean --timeout 5000 \
+				--req 'entity: {id: 1}, plugins: {name: "custom::GstCameraSystem", filename: "libGstCameraSystem.so"}' > /dev/null 2>&1
+	fi
+
 	# Start gz_bridge
 	if ! gz_bridge start -w "${PX4_GZ_WORLD}" -n "${MODEL_NAME_INSTANCE}"; then
 		echo "ERROR [init] gz_bridge failed to start and spawn model"

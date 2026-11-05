@@ -22,6 +22,9 @@ then
 	PX4_GZ_FOLLOW_OFFSET_Z=${PX4_GZ_FOLLOW_OFFSET_Z:=8}
 fi
 
+# Send fire_camera to QGroundControl on UDP port 5600. Set PX4_GZ_VIDEO_STREAM=0 to turn it off.
+PX4_GZ_VIDEO_STREAM=${PX4_GZ_VIDEO_STREAM:=1}
+
 param set-default SIM_GZ_EN 1
 
 param set-default SENS_EN_ARSPDSIM 1
