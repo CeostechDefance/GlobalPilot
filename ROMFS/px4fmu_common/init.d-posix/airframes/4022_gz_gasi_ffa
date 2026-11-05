@@ -1,0 +1,135 @@
+#!/bin/sh
+#
+# @name GASI FFA amphibious firefighting aircraft
+# @type Fixedwing
+#
+# Geometry comes from CAD; mass, thrust and aerodynamics are estimates.
+# See Tools/simulation/gz_custom_models/README.md
+#
+
+. ${R}etc/init.d/rc.fw_defaults
+
+PX4_SIMULATOR=${PX4_SIMULATOR:=gz}
+PX4_GZ_WORLD=${PX4_GZ_WORLD:=default}
+PX4_SIM_MODEL=${PX4_SIM_MODEL:=gasi_ffa}
+
+# Keep the Gazebo window on the aircraft. Set PX4_GZ_FOLLOW= (empty) to turn it off.
+if [ -z "${HEADLESS}" ]
+then
+	PX4_GZ_FOLLOW=${PX4_GZ_FOLLOW-1}
+	PX4_GZ_FOLLOW_OFFSET_X=${PX4_GZ_FOLLOW_OFFSET_X:=-22}
+	PX4_GZ_FOLLOW_OFFSET_Y=${PX4_GZ_FOLLOW_OFFSET_Y:=-22}
+	PX4_GZ_FOLLOW_OFFSET_Z=${PX4_GZ_FOLLOW_OFFSET_Z:=8}
+fi
+
+param set-default SIM_GZ_EN 1
+
+param set-default SENS_EN_ARSPDSIM 1
+
+# The Gazebo pressure sensor ignores the world elevation used by the terrain worlds.
+param set-default SENS_EN_BAROSIM 1
+param set-default SIM_GZ_EN_BARO 0
+
+param set-default FD_ESCS_EN 0
+
+# Airspeeds: stall about 25 m/s at full load in the aerodynamic model.
+param set-default FW_AIRSPD_STALL 27
+param set-default FW_AIRSPD_MIN 33
+param set-default FW_AIRSPD_TRIM 45
+param set-default FW_AIRSPD_MAX 65
+
+# Thrust grows with the square of the command: cruise with the gear up needs about 32 %.
+param set-default FW_THR_TRIM 0.57
+param set-default FW_THR_MIN 0.05
+param set-default FW_THR_MAX 1.0
+
+param set-default FW_T_CLMB_R_SP 4
+param set-default FW_T_CLMB_MAX 5
+param set-default FW_T_SINK_MAX 5
+param set-default FW_T_SINK_MIN 2.5
+
+param set-default FW_P_LIM_MAX 15
+param set-default FW_P_LIM_MIN -12
+param set-default FW_R_LIM 35
+param set-default FW_R_TC 0.6
+param set-default FW_P_TC 0.6
+
+param set-default FW_R_RMAX 40
+param set-default FW_P_RMAX_POS 20
+param set-default FW_P_RMAX_NEG 25
+
+param set-default FW_RR_FF 0.25
+param set-default FW_RR_P 0.08
+param set-default FW_RR_I 0.05
+param set-default FW_PR_FF 0.35
+param set-default FW_PR_P 0.45
+param set-default FW_PR_I 0.15
+param set-default FW_YR_FF 0.3
+param set-default FW_YR_P 0.2
+param set-default FW_YR_I 0.05
+
+param set-default NPFG_PERIOD 20
+param set-default NAV_ACC_RAD 60
+param set-default NAV_DLL_ACT 0
+param set-default MIS_TAKEOFF_ALT 60
+
+# Runway takeoff. The thrust line is 0.91 m above the CG and the main gear reaction vanishes at
+# liftoff, so a wound-up elevator throws the nose up. Limit the integrator and the pitch rate
+# instead of the thrust: at reduced thrust the aircraft does not reach flying speed cleanly.
+param set-default RWTO_TKOFF 1
+param set-default RWTO_ROT_AIRSPD 36
+param set-default RWTO_RAMP_TIME 3
+param set-default FW_TKO_PITCH_MIN 8
+param set-default FW_PR_IMAX 0.2
+
+# The rudder steers on the ground: the nose wheel has no steering joint.
+param set-default FW_W_EN 1
+
+# Landing: no range sensor, so the approach uses the altitude of the landing point.
+param set-default FW_LND_ANG 4
+param set-default FW_LND_ABORT 0
+param set-default FW_LND_USETER 0
+param set-default FW_LND_FLALT 8
+param set-default FW_LND_AIRSPD 35
+
+param set-default CA_AIRFRAME 1
+
+param set-default COM_PREARM_MODE 2
+
+# The rotor position stays at its default on purpose: entering the real offset (1.47 m aft,
+# 0.91 m up) makes the allocator trade thrust for pitch torque. The rate loop handles that moment.
+param set-default CA_ROTOR_COUNT 1
+
+# The wing surfaces work as ailerons only. Retracted flaps are -1 in the allocator, so a
+# CA_SV_CSn_FLAP scale here would hold them deflected in cruise and jump them on approach.
+param set-default CA_SV_CS_COUNT 4
+param set-default CA_SV_CS0_TRQ_R -0.5
+param set-default CA_SV_CS0_TYPE 1
+param set-default CA_SV_CS1_TRQ_R 0.5
+param set-default CA_SV_CS1_TYPE 2
+param set-default CA_SV_CS2_TRQ_P 1
+param set-default CA_SV_CS2_TYPE 3
+param set-default CA_SV_CS3_TRQ_Y 1
+param set-default CA_SV_CS3_TYPE 4
+
+param set-default SIM_GZ_EC_FUNC1 101
+param set-default SIM_GZ_EC_MIN1 0
+param set-default SIM_GZ_EC_MAX1 1000
+
+param set-default SIM_GZ_SV_FUNC1 201
+param set-default SIM_GZ_SV_FUNC2 202
+param set-default SIM_GZ_SV_FUNC3 203
+param set-default SIM_GZ_SV_FUNC4 204
+
+# Landing gear: down = -45, up = +45, disarmed = 0. GearSequencerSystem reads only the sign, so
+# every value except an explicit up command means gear down.
+param set-default SIM_GZ_SV_FUNC5 400
+
+param set-default SIM_GZ_SV_MAXA1 30
+param set-default SIM_GZ_SV_MINA1 -30
+param set-default SIM_GZ_SV_MAXA2 30
+param set-default SIM_GZ_SV_MINA2 -30
+param set-default SIM_GZ_SV_MAXA3 25
+param set-default SIM_GZ_SV_MINA3 -25
+param set-default SIM_GZ_SV_MAXA4 25
+param set-default SIM_GZ_SV_MINA4 -25
