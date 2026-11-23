@@ -1,0 +1,6 @@
+capacity 400
+position 0.031 0 -0.386
+fill_rate 40
+speed_min 22.222
+speed_max 27.5
+initial 0
