@@ -60,12 +60,6 @@ Senaryo testleri:
 cd Tools/simulation/gz_custom_models/scenarios && python3 -m pytest -q tests
 ```
 
-### Sınırlar
-
-Aerodinamik katsayılar CAD'den ve kuyruk hacmi yöntemiyle tahmin edilmiştir; rüzgâr tüneli, CFD ya da uçuş verisiyle
-ayarlanmamıştır. Su fiziğindeki basınç ve direnç katsayıları da tahmindir. Simülasyondaki davranış gerçek uçağın tahmini
-değil, makul bir yaklaşıktır.
-
 ## PX4
 
 Uçuş yazılımının temeli PX4'tür: [px4.io](https://px4.io), [kullanıcı ve geliştirici rehberi](https://docs.px4.io/main/en/).
