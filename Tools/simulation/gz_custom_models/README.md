@@ -26,7 +26,7 @@ follow defaults are in the airframe; `PX4_GZ_FOLLOW=` (empty) turns them off.
 | Taken from the CAD | Estimated (top of `generate_gasi_ffa.py`) |
 |---|---|
 | Outer shape, colours, moving surfaces and hinge lines | Airframe, engine and equipment masses |
-| Wing 17.27 m², span 9 m, MAC 1.94 m, tail areas | Thrust 5000 N (from 280 hp, 4400 rpm, figure of merit 0.7), drag CD0 0.04, CL0 0.30 |
+| Span 9 m, MAC 1.96 m, tail and control surface areas (wing area 15 m² is from the design data; the CAD plan area is 17.5 m²) | Thrust 5000 N (from 280 hp, 4400 rpm, figure of merit 0.7), drag CD0 0.04, CL0 0.30 |
 | Wheel positions, propeller axis | All stability and control derivatives |
 | Water 395 L, fuel tank 100 L | Rolling resistance |
 
@@ -89,14 +89,17 @@ simulated: no heat, no spreading, no wind and no effect from water. The smoke le
 `fire_camera`, computes their position from the camera ray and the terrain, flies over that point and releases
 water. If the curtain's centre falls within 165 m along and 60 m across the track, the flames go out. The real
 fire position is used only for this score. The detector is tuned to the simulated textures and does not
-generalise to real fires. The water is visual: aircraft mass and CG do not change after the release.
+generalise to real fires. With `--scoop` it first lands on the water and scoops (`water_leg.py`). The release
+empties the tank in the physics as well (`/model/<model>/water/release`).
 
 ### Not modelled
 
 
-- Water: no scooping, no drop, no change of mass or CG in flight. Hull buoyancy and drag on terrain worlds with water come from the `gz_geo_terrain` plugin, using the hull surface through `gasi_ffa/hull_columns.txt` (draft about 0.50 m at rest at the current mass, about 0.33 m planing at 93 km/h with 3000 N; the hull counts as solid and the pressure and drag coefficients are estimates, not fitted to test data). Regenerate that file with `gz_geo_terrain/tools/make_hull_columns.py` when the body mesh changes.
-- Measured gear data: suspension values are assumptions. Wheel brakes and nose wheel steering are in the model but off by default.
+- Water inside the hull: the tank (`gasi_ffa/water_tank.txt`: 400 kg, fills at 40 kg/s while the hull is wet between
+  22.2 and 27.5 m/s) changes only the weight and the momentum drag, as forces at the tank position; the water does not
+  slosh. Hull buoyancy and drag on terrain worlds with water come from the `gz_geo_terrain` plugin, using the hull surface through `gasi_ffa/hull_columns.txt` (draft about 0.50 m at rest at the current mass, about 0.33 m planing at 93 km/h with 3000 N; the hull counts as solid and the pressure and drag coefficients are estimates, not fitted to test data). Regenerate that file with `gz_geo_terrain/tools/make_hull_columns.py` when the body mesh changes.
+- Measured gear data: suspension, brake and nose wheel steering values are assumptions.
 - Separate fold kinematics of the sway links: each gear folds as one rigid part. Gear loads and door air loads.
 - Thrust loss with airspeed: the motor plugin gives the same thrust at any speed.
-- Flaps: the wing surfaces work as ailerons only.
+- Propeller slipstream on the wing and tail.
 - Damage. A crash into terrain shows up only in the logs as a high sink rate.
