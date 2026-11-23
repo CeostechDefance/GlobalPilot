@@ -89,6 +89,10 @@
 #include <uORB/topics/vehicle_local_position_setpoint.h>
 #include <uORB/topics/vehicle_status.h>
 #include <uORB/topics/wind.h>
+#include <uORB/topics/vehicle_thrust_setpoint.h>
+#include <uORB/topics/vehicle_command_ack.h>
+#include <uORB/topics/debug_key_value.h>
+#include <systemlib/mavlink_log.h>
 #include <uORB/topics/orbit_status.h>
 
 #ifdef CONFIG_FIGURE_OF_EIGHT
@@ -184,6 +188,7 @@ private:
 	uORB::Subscription _trajectory_setpoint_sub{ORB_ID(trajectory_setpoint)};
 	uORB::Subscription _vehicle_angular_velocity_sub{ORB_ID(vehicle_angular_velocity)};
 	uORB::Subscription _vehicle_attitude_sub{ORB_ID(vehicle_attitude)};
+	uORB::Subscription _vehicle_thrust_setpoint_sub{ORB_ID(vehicle_thrust_setpoint)};
 	uORB::Subscription _vehicle_command_sub{ORB_ID(vehicle_command)};
 	uORB::Subscription _vehicle_land_detected_sub{ORB_ID(vehicle_land_detected)};
 	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};
@@ -250,6 +255,16 @@ private:
 	double _current_longitude{0};
 	float _current_altitude{0.f};
 
+	float _pitch{0.0f};
+	float _roll{0.0f};
+
+	// flare law 6: stall speed (1 g, landing flaps) estimated on the approach from the synthetic angle of attack
+	// (pitch - flight path angle) and FW_LND_VS_CL0/CLA/CLMX, so the landing speeds do not need the weight
+	float _vs_est{NAN}; // [m/s] filtered estimate, frozen at flare start
+	float _vs_est_settled{0.0f}; // [s] time the estimate has been filtered for
+	hrt_abstime _vs_est_last_call{0};
+	hrt_abstime _vs_est_last_sample{0};
+	hrt_abstime _vs_wings_level_since{0}; // samples only after this long wings level (turn exit bias)
 	float _yaw{0.0f};
 	float _yawrate{0.0f};
 
@@ -288,6 +303,17 @@ private:
 
 	// [m] ground altitude AMSL where the plane was launched
 	float _takeoff_ground_alt{0.0f};
+
+	// runway takeoff exit blend (FW_TKO_BLEND_T): last time in climbout and the limits held there
+	hrt_abstime _time_takeoff_climbout_last{0};
+	float _takeoff_exit_pitch_min{0.0f};
+	float _takeoff_exit_throttle{0.0f};
+
+	/**
+	 * Releases the runway takeoff pitch floor and throttle over FW_TKO_BLEND_T after the climbout ends.
+	 * Tightens the limits of the current cycle only; called after the mode has set its own.
+	 */
+	void apply_takeoff_exit_blend(const hrt_abstime now);
 
 	// class handling launch detection methods for fixed-wing takeoff
 	LaunchDetector _launchDetector;
@@ -335,7 +361,91 @@ private:
 		bool flaring{false};
 		hrt_abstime start_time{0}; // [us]
 		float initial_height_rate_setpoint{0.0f}; // [m/s]
+		float start_height{0.0f}; // [m] height above the touchdown point when the flare started
+		float start_pitch{0.0f}; // [rad] pitch angle when the flare started (flare law 3)
+		float sink_rate_integral{0.0f}; // [rad] integral term of the flare law 3 pitch command
+		float throttle_integral{0.0f}; // [-] integral term of the flare law 4 throttle command
+		float attitude_offset{0.0f}; // [rad] flare law 4 landing attitude reduction by the airspeed guard (<= 0)
+		bool attitude_hold{false}; // flare law 4: false = decelerating (pitch holds the sink rate, idle throttle)
+		float hold_pitch{0.0f}; // [rad] flare law 4 pitch command, rate limited towards the landing attitude
+		float throttle_cmd{0.0f}; // [-] flare law 4 throttle command, slew rate limited
+		float throttle_start{0.0f}; // [-] flare law 6 throttle at flare start (centre of the airspeed PI)
+		float start_airspeed{0.0f}; // [m/s] flare law 6 airspeed at flare start
+		float pitch_cmd{0.0f}; // [rad] flare law 6 rate limited pitch command
+		bool touchdown{false}; // flare law 6: touchdown latched (sink rate collapsed near the ground)
+		float touchdown_timer{0.0f}; // [s] flare law 6 time the touchdown condition has held
+		float last_range{NAN}; // [m] flare law 6 last valid range finder reading (water: hull under the radar)
+		hrt_abstime last_update{0}; // [us] last flare law 4 update
 	} _flare_states;
+
+	// Flare law 6 step (shared by the runway landing and the water scoop: same algorithm, surface profile)
+	struct Law6Profile {
+		float vtd_k;            // touchdown airspeed / estimated stall speed
+		float pitch_max_rad;    // flare pitch upper limit
+		bool water;             // true: no retard and no runway pitch after touchdown (scoop continues)
+	};
+
+	struct Law6Output {
+		float pitch;            // [rad]
+		float pitch_min;        // [rad]
+		float pitch_max;        // [rad]
+		float throttle;         // [-]
+		float sink_setpoint;    // [m/s] down positive
+		float airspeed_setpoint; // [m/s]
+		bool touched_down;
+	};
+
+	void law6Start(FlareStates &fs, const hrt_abstime now, const float height);
+	Law6Output law6Step(FlareStates &fs, const hrt_abstime now, const float height, const Law6Profile &profile);
+
+	// GASI water scoop (mission item MAV_CMD_USER_1 + two waypoints at the water surface): approach on a glide slope,
+	// flare law 6 (water profile), touchdown with power, hold the scoop airspeed, take off. Go-around by
+	// MAV_CMD_DO_GO_AROUND or own checks; afterwards AUTO.LOITER, the planner decides (MISSION_SET_CURRENT).
+	enum class ScoopPhase : uint8_t { OFF = 0, APPROACH = 1, GATE_PASSED = 2, FLARE = 3, TOUCHDOWN = 4, SCOOP = 5,
+					  TAKEOFF = 6, DONE = 7, ABORT = 8 };
+
+	struct ScoopState {
+		bool armed{false};
+		float target_speed{25.f};
+		float duration{10.f};
+		float speed_min{22.22f};
+		float water_amsl{NAN};
+		ScoopPhase phase{ScoopPhase::OFF};
+		Vector2f entrance{};    // local, approach line start
+		Vector2f touchdown{};   // local, touchdown point (first water waypoint)
+		float entrance_alt{0.f};
+		hrt_abstime phase_start{0};
+		hrt_abstime last_update{0};
+		hrt_abstime last_status{0};
+		float scoop_time{0.f};  // [s] in the speed band on the water
+		float out_of_band{0.f}; // [s] out of the band after the scoop started
+		float out_of_abort_band{0.f}; // [s] out of the abort band (FW_SC_A_VMIN..FW_SC_A_VMAX) after the scoop started
+		float speed_lo{INFINITY};
+		float speed_hi{0.f};
+		bool scoop_started{false};
+		float pitch_cmd{0.f};
+		float throttle_cmd{0.f};
+		float throttle_integral{0.f};
+		bool loiter_sent{false};
+		bool on_water{false}; // touchdown latched: the radar may be under the water line, height from the altitude
+		float last_airspeed{0.f};
+		float accel_filt{0.f}; // [m/s^2] filtered airspeed rate on the water
+		float liftoff_airspeed{0.f};
+		hrt_abstime liftoff_time{0};
+		FlareStates flare{};
+	} _scoop;
+
+	orb_advert_t _mavlink_log_pub{nullptr};
+	uORB::Publication<vehicle_command_s> _vehicle_command_pub{ORB_ID(vehicle_command)};
+	uORB::Publication<vehicle_command_ack_s> _vehicle_command_ack_pub{ORB_ID(vehicle_command_ack)};
+	uORB::Publication<debug_key_value_s> _debug_key_value_pub{ORB_ID(debug_key_value)};
+
+	static const char *scoopPhaseName(ScoopPhase phase);
+	void setScoopPhase(const hrt_abstime now, ScoopPhase phase, const char *detail = nullptr);
+	void scoopAbort(const hrt_abstime now, const char *reason);
+	bool scoopEngage(const position_setpoint_s &pos_sp_prev, const position_setpoint_s &pos_sp_curr);
+	void control_auto_scoop(const hrt_abstime &now, const float control_interval, const Vector2f &ground_speed,
+				const position_setpoint_s &pos_sp_curr);
 
 	// [m] last terrain estimate which was valid
 	float _last_valid_terrain_alt_estimate{0.0f};
@@ -356,6 +466,9 @@ private:
 
 	// [us] last time airspeed was received. used to detect timeouts.
 	hrt_abstime _time_airspeed_last_valid{0};
+	// [us] last accepted airspeed sample. _time_airspeed_last_valid is never set in this version (upstream), so
+	// _airspeed_valid is always false; flare law 4 uses this one instead and leaves the upstream logic as it is.
+	hrt_abstime _time_airspeed_sample{0};
 
 	// WIND
 
@@ -695,6 +808,14 @@ private:
 	 * @param abort_on_terrain_timeout Abort if distance to ground estimation is invalid after being valid before
 	 * @return Terrain altitude (AMSL) [m]
 	 */
+	/**
+	 * @brief Updates the flare law 6 stall speed estimate on the landing approach (frozen while flaring).
+	 *
+	 * @param height Height above the touchdown point [m]
+	 * @return Estimated 1 g stall speed with landing flaps [m/s], NAN until settled
+	 */
+	float updateStallSpeedEstimate(const hrt_abstime now, const float height);
+
 	float getLandingTerrainAltitudeEstimate(const hrt_abstime &now, const float land_point_altitude,
 						const bool abort_on_terrain_measurement_timeout, const bool abort_on_terrain_timeout);
 
@@ -868,11 +989,72 @@ private:
 		(ParamBool<px4::params::RWTO_NUDGE>) _param_rwto_nudge,
 		(ParamFloat<px4::params::FW_LND_FL_TIME>) _param_fw_lnd_fl_time,
 		(ParamFloat<px4::params::FW_LND_FL_SINK>) _param_fw_lnd_fl_sink,
+		(ParamInt<px4::params::FW_LND_FL_LAW>) _param_fw_lnd_fl_law,
+		(ParamFloat<px4::params::FW_LND_FL_HOLD>) _param_fw_lnd_fl_hold,
+		(ParamFloat<px4::params::FW_LND_FL_SPDW>) _param_fw_lnd_fl_spdw,
+		(ParamFloat<px4::params::FW_LND_FL_KP>) _param_fw_lnd_fl_kp,
+		(ParamFloat<px4::params::FW_LND_FL_KI>) _param_fw_lnd_fl_ki,
+		(ParamFloat<px4::params::FW_LND_FL_ATT>) _param_fw_lnd_fl_att,
+		(ParamFloat<px4::params::FW_LND_FL_TATT>) _param_fw_lnd_fl_tatt,
+		(ParamFloat<px4::params::FW_LND_FL_SNK1>) _param_fw_lnd_fl_snk1,
+		(ParamFloat<px4::params::FW_LND_FL_TFF>) _param_fw_lnd_fl_tff,
+		(ParamFloat<px4::params::FW_LND_FL_TKP>) _param_fw_lnd_fl_tkp,
+		(ParamFloat<px4::params::FW_LND_FL_TKI>) _param_fw_lnd_fl_tki,
+		(ParamFloat<px4::params::FW_LND_FL_VMIN>) _param_fw_lnd_fl_vmin,
+		(ParamFloat<px4::params::FW_LND_FL_VATT>) _param_fw_lnd_fl_vatt,
+		(ParamFloat<px4::params::FW_LND_FL_TSLW>) _param_fw_lnd_fl_tslw,
+		(ParamFloat<px4::params::FW_LND_VS_CL0>) _param_fw_lnd_vs_cl0,
+		(ParamFloat<px4::params::FW_LND_VS_CLA>) _param_fw_lnd_vs_cla,
+		(ParamFloat<px4::params::FW_LND_VS_CLMX>) _param_fw_lnd_vs_clmx,
+		(ParamFloat<px4::params::FW_LND_VAPP_K>) _param_fw_lnd_vapp_k,
+		(ParamFloat<px4::params::FW_LND_VTD_K>) _param_fw_lnd_vtd_k,
+		(ParamFloat<px4::params::FW_LND_FL_PRT>) _param_fw_lnd_fl_prt,
+		(ParamFloat<px4::params::FW_SC_VTD_K>) _param_fw_sc_vtd_k,
+		(ParamFloat<px4::params::FW_SC_PMAX>) _param_fw_sc_pmax,
+		(ParamFloat<px4::params::FW_SC_PITCH>) _param_fw_sc_pitch,
+		(ParamFloat<px4::params::FW_SC_TO_PITCH>) _param_fw_sc_to_pitch,
+		(ParamFloat<px4::params::FW_SC_VMAX>) _param_fw_sc_vmax,
+		(ParamFloat<px4::params::FW_SC_TKP>) _param_fw_sc_tkp,
+		(ParamFloat<px4::params::FW_SC_TKI>) _param_fw_sc_tki,
+		(ParamFloat<px4::params::FW_SC_GA_ALT>) _param_fw_sc_ga_alt,
+		(ParamFloat<px4::params::FW_SC_LOOK>) _param_fw_sc_look,
+		(ParamFloat<px4::params::FW_SC_THR_FF>) _param_fw_sc_thr_ff,
+		(ParamFloat<px4::params::FW_SC_FF_VS>) _param_fw_sc_ff_vs,
+		(ParamFloat<px4::params::FW_SC_FILL>) _param_fw_sc_fill,
+		(ParamFloat<px4::params::FW_SC_TMAX>) _param_fw_sc_tmax,
+		(ParamFloat<px4::params::FW_SC_P_THR>) _param_fw_sc_p_thr,
+		(ParamFloat<px4::params::FW_SC_LIFT_H>) _param_fw_sc_lift_h,
+		(ParamFloat<px4::params::FW_SC_CLB_DEC>) _param_fw_sc_clb_dec,
+		(ParamFloat<px4::params::FW_SC_V_MARG>) _param_fw_sc_v_marg,
+		(ParamFloat<px4::params::FW_SC_A_VMIN>) _param_fw_sc_a_vmin,
+		(ParamFloat<px4::params::FW_SC_A_VMAX>) _param_fw_sc_a_vmax,
+		(ParamFloat<px4::params::FW_SC_G_XTRK>) _param_fw_sc_g_xtrk,
+		(ParamFloat<px4::params::FW_SC_G_CRS>) _param_fw_sc_g_crs,
+		(ParamFloat<px4::params::FW_SC_G_ROLL>) _param_fw_sc_g_roll,
+		(ParamFloat<px4::params::FW_SC_G_SPD>) _param_fw_sc_g_spd,
+		(ParamFloat<px4::params::FW_SC_A_ROLL>) _param_fw_sc_a_roll,
+		(ParamFloat<px4::params::FW_SC_A_XTRK>) _param_fw_sc_a_xtrk,
+		(ParamFloat<px4::params::FW_SC_A_HMIN>) _param_fw_sc_a_hmin,
+		(ParamFloat<px4::params::FW_SC_OOB_T>) _param_fw_sc_oob_t,
+		(ParamFloat<px4::params::FW_SC_T_MARG>) _param_fw_sc_t_marg,
+		(ParamFloat<px4::params::FW_SC_DONE_H>) _param_fw_sc_done_h,
+		(ParamFloat<px4::params::FW_SC_CLB_H>) _param_fw_sc_clb_h,
+		(ParamFloat<px4::params::FW_SC_GA_H>) _param_fw_sc_ga_h,
+		(ParamFloat<px4::params::FW_LND_TD_RNG>) _param_fw_lnd_td_rng,
+		(ParamFloat<px4::params::FW_LND_TD_VZ>) _param_fw_lnd_td_vz,
+		(ParamFloat<px4::params::FW_LND_TD_T>) _param_fw_lnd_td_t,
+		(ParamFloat<px4::params::FW_LND_VS_HMIN>) _param_fw_lnd_vs_hmin,
+		(ParamFloat<px4::params::FW_LND_VS_ROLL>) _param_fw_lnd_vs_roll,
+		(ParamFloat<px4::params::FW_LND_VS_LVL>) _param_fw_lnd_vs_lvl,
+		(ParamFloat<px4::params::FW_LND_VS_TAU>) _param_fw_lnd_vs_tau,
+		(ParamFloat<px4::params::WEIGHT_BASE>) _param_weight_base,
+		(ParamFloat<px4::params::WEIGHT_GROSS>) _param_weight_gross,
 		(ParamFloat<px4::params::FW_LND_TD_TIME>) _param_fw_lnd_td_time,
 		(ParamFloat<px4::params::FW_LND_TD_OFF>) _param_fw_lnd_td_off,
 		(ParamInt<px4::params::FW_LND_NUDGE>) _param_fw_lnd_nudge,
 		(ParamInt<px4::params::FW_LND_ABORT>) _param_fw_lnd_abort,
 		(ParamFloat<px4::params::FW_TKO_AIRSPD>) _param_fw_tko_airspd,
+		(ParamFloat<px4::params::FW_TKO_BLEND_T>) _param_fw_tko_blend_t,
 		(ParamFloat<px4::params::RWTO_PSP>) _param_rwto_psp,
 		(ParamBool<px4::params::FW_LAUN_DETCN_ON>) _param_fw_laun_detcn_on,
 		(ParamFloat<px4::params::FW_AIRSPD_MAX>) _param_fw_airspd_max,

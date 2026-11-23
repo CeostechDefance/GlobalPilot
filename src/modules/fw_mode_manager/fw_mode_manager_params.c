@@ -238,6 +238,25 @@ PARAM_DEFINE_FLOAT(FW_LND_ANG, 5.0f);
 PARAM_DEFINE_FLOAT(FW_TKO_PITCH_MIN, 10.0f);
 
 /**
+ * Runway takeoff exit blend time
+ *
+ * When the runway takeoff climbout ends, the pitch floor (FW_TKO_PITCH_MIN) and the fixed takeoff
+ * throttle (RWTO_MAX_THR) are released over this time instead of at once: the pitch floor ramps down to
+ * FW_P_LIM_MIN, the throttle range opens from the takeoff throttle to FW_THR_MIN..FW_THR_MAX and the
+ * flaps retract from FW_FLAPS_TO_SCL. This avoids a step in pitch, throttle and lift at the end of the takeoff.
+ *
+ * Set to 0 to release both at once.
+ *
+ * @unit s
+ * @min 0.0
+ * @max 30.0
+ * @decimal 1
+ * @increment 0.5
+ * @group FW Auto Takeoff
+ */
+PARAM_DEFINE_FLOAT(FW_TKO_BLEND_T, 0.0f);
+
+/**
  * Takeoff Airspeed
  *
  * The calibrated airspeed setpoint during the takeoff climbout.
@@ -518,6 +537,317 @@ PARAM_DEFINE_FLOAT(FW_LND_TD_TIME, -1.0f);
 PARAM_DEFINE_FLOAT(FW_LND_FL_SINK, 0.25f);
 
 /**
+ * Landing flare law
+ *
+ * How the sink rate, pitch limits and throttle limit move from the approach values to the touchdown values
+ * during the flare of a straight (runway) landing. Circular landings always use the time based ramp.
+ *
+ * 0: time based ramps over FW_LND_FL_TIME (PX4 default).
+ * 1: height based linear sink rate (exponential flare). The sink rate setpoint goes linearly with height from the
+ *    sink rate at flare start to FW_LND_FL_SINK at FW_LND_FL_HOLD, so height decays exponentially in time.
+ *    Pitch limits are blended with the same height fraction. Throttle goes to idle over FW_LND_FL_TIME as in 0.
+ * 2: constant vertical deceleration (circular arc flare). The sink rate goes down linearly in time from the sink
+ *    rate at flare start to FW_LND_FL_SINK at FW_LND_FL_HOLD. Limits are blended as in 1.
+ *
+ * 3: autoland style. Sink rate profile as in 1, but the sink rate error drives the pitch setpoint directly through a
+ *    PI controller (FW_LND_FL_KP, FW_LND_FL_KI) around the pitch angle at flare start, bypassing TECS for pitch.
+ *    Pitch is constrained by the blended limits of 1; throttle goes to idle over FW_LND_FL_TIME.
+ * 4: power-on attitude landing (seaplane glassy water technique, FAA-H-8083-23 ch. 6). At the flare height the pitch is
+ *    brought to FW_LND_FL_ATT over FW_LND_FL_TATT and held; throttle controls the sink rate (FW_LND_FL_SNK1 above
+ *    FW_LND_FL_HOLD, FW_LND_FL_SINK below) with a PI (FW_LND_FL_TKP, FW_LND_FL_TKI) around FW_LND_FL_TFF. With the
+ *    angle of attack held and lift equal to weight, the touchdown airspeed depends only on the attitude and the weight,
+ *    not on the pattern or the flare height. The throttle goes to idle at touchdown (land detector). Needs a height
+ *    above ground at decimetre level: use a downward range finder (FW_LND_USETER 1).
+ * 5: airliner style. Sink rate FW_LND_FL_SNK1, FW_LND_FL_SINK below FW_LND_FL_HOLD, held by pitch (PI FW_LND_FL_KP/KI
+ *    around the pitch at flare start, up to FW_LND_FL_PMAX). Throttle holds FW_LND_FL_VATT (weight scaled) with a PI
+ *    (FW_LND_FL_TKP/TKI per m/s, centre FW_LND_FL_TFF), moving at FW_LND_FL_TSLW, and goes to idle below
+ *    FW_LND_FL_HOLD (retard). Unlike 3 the throttle is not cut at flare start.
+ * 6: as 5, for an unknown weight. The 1 g stall speed is estimated on the approach from the synthetic angle of attack
+ *    (FW_LND_VS_CL0/CLA/CLMX); the approach airspeed is FW_LND_VAPP_K times it (also the lower airspeed limit, so
+ *    WEIGHT_GROSS does not hold the aircraft fast). The flare throttle starts from the approach throttle and holds an
+ *    airspeed falling with height to FW_LND_VTD_K times the stall speed at FW_LND_FL_HOLD, until touchdown (no retard).
+ *
+ * @value 0 Time based (PX4)
+ * @value 1 Height based exponential
+ * @value 2 Constant deceleration
+ * @value 3 Exponential, direct pitch (autoland style)
+ * @value 4 Power-on attitude (throttle controls the sink rate)
+ * @value 5 Airliner style (pitch holds the sink rate, throttle holds FW_LND_FL_VATT, retard below FW_LND_FL_HOLD)
+ * @value 6 Airliner style with estimated stall speed (weight independent)
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_INT32(FW_LND_FL_LAW, 0);
+
+/**
+ * Landing flare hold-off height
+ *
+ * Height above the touchdown point at which the height based flare laws (FW_LND_FL_LAW 1 and 2) reach
+ * FW_LND_FL_SINK and the touchdown pitch limits. Below it the sink rate stays at FW_LND_FL_SINK.
+ *
+ * @unit m
+ * @min 0.0
+ * @max 5.0
+ * @decimal 1
+ * @increment 0.1
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_FL_HOLD, 1.0f);
+
+/**
+ * Landing flare speed weight
+ *
+ * TECS speed weight during the flare of the height based flare laws (FW_LND_FL_LAW 1 and 2).
+ * 0 makes pitch control only the sink rate while the airspeed bleeds off at idle throttle.
+ * Negative keeps FW_T_SPDWEIGHT.
+ *
+ * @min -1.0
+ * @max 2.0
+ * @decimal 1
+ * @increment 0.1
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_FL_SPDW, -1.0f);
+
+/**
+ * Landing flare sink rate to pitch proportional gain
+ *
+ * Flare law 3 only. Pitch change per sink rate error.
+ *
+ * @unit deg
+ * @min 0.0
+ * @max 20.0
+ * @decimal 1
+ * @increment 0.5
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_FL_KP, 3.0f);
+
+/**
+ * Landing flare sink rate to pitch integral gain
+ *
+ * Flare law 3 only. Pitch change per second per sink rate error.
+ *
+ * @unit deg
+ * @min 0.0
+ * @max 20.0
+ * @decimal 1
+ * @increment 0.5
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_FL_KI, 1.0f);
+
+/**
+ * Landing attitude of flare law 4
+ *
+ * Pitch held from the end of the attitude transition to touchdown. It sets the angle of attack and so the touchdown
+ * airspeed for a given weight.
+ *
+ * @unit deg
+ * @min 0.0
+ * @max 12.0
+ * @decimal 1
+ * @increment 0.5
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_FL_ATT, 6.0f);
+
+/**
+ * Attitude transition time of flare law 4
+ *
+ * Time to bring the pitch from its value at flare start to FW_LND_FL_ATT, and the sink rate setpoint from its value at
+ * flare start to FW_LND_FL_SNK1.
+ *
+ * @unit s
+ * @min 0.5
+ * @max 20.0
+ * @decimal 1
+ * @increment 0.5
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_FL_TATT, 4.0f);
+
+/**
+ * Sink rate of flare law 4 above FW_LND_FL_HOLD
+ *
+ * Below FW_LND_FL_HOLD the sink rate setpoint is FW_LND_FL_SINK.
+ *
+ * @unit m/s
+ * @min 0.1
+ * @max 3.0
+ * @decimal 2
+ * @increment 0.05
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_FL_SNK1, 0.75f);
+
+/**
+ * Throttle feedforward of flare law 4
+ *
+ * Throttle at the start of the attitude hold and the PI's centre (user decision 2026-11-10: start at 20 %).
+ * From there the throttle moves at FW_LND_FL_TSLW.
+ *
+ * @min 0.0
+ * @max 1.0
+ * @decimal 2
+ * @increment 0.01
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_FL_TFF, 0.20f);
+
+/**
+ * Throttle proportional gain of flare law 4
+ *
+ * Throttle per m/s of sink rate error (sinking faster than the setpoint adds throttle).
+ *
+ * @min 0.0
+ * @max 2.0
+ * @decimal 2
+ * @increment 0.01
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_FL_TKP, 0.15f);
+
+/**
+ * Throttle integral gain of flare law 4
+ *
+ * Throttle per m of accumulated sink rate error.
+ *
+ * @min 0.0
+ * @max 2.0
+ * @decimal 2
+ * @increment 0.01
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_FL_TKI, 0.10f);
+
+/**
+ * Minimum airspeed of flare law 4 at WEIGHT_BASE
+ *
+ * Scaled with sqrt(WEIGHT_GROSS / WEIGHT_BASE). Below it the landing attitude is lowered by up to 2 deg (1 deg/s) and
+ * restored at 0.5 deg/s once the airspeed recovers. 0 disables the guard.
+ *
+ * @unit m/s
+ * @min 0.0
+ * @max 60.0
+ * @decimal 1
+ * @increment 0.5
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_FL_VMIN, 0.0f);
+
+/**
+ * Attitude hold airspeed of flare law 4 at WEIGHT_BASE
+ *
+ * Flare law 4 decelerates at idle (pitch holds the sink rate) until the airspeed falls to this value, scaled with
+ * sqrt(WEIGHT_GROSS / WEIGHT_BASE), then holds FW_LND_FL_ATT and controls the sink rate with throttle. Set it to the
+ * equilibrium airspeed at the landing attitude. 0: switch when the pitch reaches FW_LND_FL_ATT.
+ *
+ * @unit m/s
+ * @min 0.0
+ * @max 60.0
+ * @decimal 1
+ * @increment 0.5
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_FL_VATT, 0.0f);
+
+/**
+ * Throttle slew rate of flare law 4
+ *
+ * Maximum throttle change per second in the flare, also from idle at the start of the attitude hold. The thrust line
+ * lies above the CG: a fast throttle change pitches the aircraft before the elevator can hold the attitude at landing
+ * airspeed. 0 disables the limit.
+ *
+ * @unit 1/s
+ * @min 0.0
+ * @max 2.0
+ * @decimal 2
+ * @increment 0.01
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_FL_TSLW, 0.10f);
+
+/**
+ * Landing lift coefficient at zero synthetic angle of attack (flare law 6)
+ *
+ * Lift coefficient with landing flaps at pitch = flight path angle, for the stall speed estimate. Fit from approach
+ * data of known weight: CL = 2 m g cos(roll) / (rho V^2 S) against pitch - asin(-vz / V).
+ *
+ * @min 0.0
+ * @max 3.0
+ * @decimal 3
+ * @increment 0.01
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_VS_CL0, 0.97f);
+
+/**
+ * Landing lift curve slope (flare law 6)
+ *
+ * Per radian of synthetic angle of attack.
+ * @min 1.0
+ * @max 8.0
+ * @decimal 2
+ * @increment 0.05
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_VS_CLA, 4.7f);
+
+/**
+ * Landing maximum lift coefficient (flare law 6)
+ *
+ * Lift coefficient at the stall with landing flaps; defines the estimated stall speed V sqrt(CL / CLMX).
+ *
+ * @min 0.5
+ * @max 4.0
+ * @decimal 3
+ * @increment 0.01
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_VS_CLMX, 1.83f);
+
+/**
+ * Approach airspeed over the estimated stall speed (flare law 6)
+ *
+ * @min 1.1
+ * @max 2.0
+ * @decimal 2
+ * @increment 0.01
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_VAPP_K, 1.30f);
+
+/**
+ * Touchdown airspeed over the estimated stall speed (flare law 6)
+ *
+ * The flare throttle holds an airspeed falling linearly with height from the flare start airspeed to this times the
+ * estimated stall speed at FW_LND_FL_HOLD. Same ratio, same angle of attack: the touchdown pitch does not depend on
+ * the weight.
+ *
+ * @min 1.0
+ * @max 1.5
+ * @decimal 2
+ * @increment 0.01
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_VTD_K, 1.12f);
+
+/**
+ * Flare pitch rate limit (flare law 6)
+ *
+ * The flare pitch command moves at most this fast, up and down, so the nose is raised slowly. The sink rate PI does not
+ * integrate while the command is held by the rate limit in the error's direction. 0 disables the limit.
+ *
+ * @unit deg/s
+ * @min 0.0
+ * @max 20.0
+ * @decimal 1
+ * @increment 0.5
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_FL_PRT, 3.0f);
+
+/**
  * Maximum lateral position offset for the touchdown point
  *
  * @unit m
@@ -621,3 +951,454 @@ PARAM_DEFINE_FLOAT(FW_FLAPS_LND_SCL, 1.0f);
  * @group FW Auto Landing
  */
 PARAM_DEFINE_FLOAT(FW_SPOILERS_LND, 0.f);
+
+/**
+ * Water scoop: touchdown airspeed over the estimated stall speed
+ *
+ * Flare law 6 on the water (MAV_CMD_USER_1 scoop item). Higher than FW_LND_VTD_K: lower nose at touchdown, the aft
+ * hull cone touches the water at 6-7 deg with the step 5-10 cm under.
+ *
+ * @min 1.0
+ * @max 1.5
+ * @decimal 2
+ * @increment 0.01
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_VTD_K, 1.15f);
+
+/**
+ * Water scoop: flare pitch upper limit
+ *
+ * @unit deg
+ * @min 0.0
+ * @max 15.0
+ * @decimal 1
+ * @increment 0.5
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_PMAX, 6.0f);
+
+/**
+ * Water scoop: pitch held while scooping on the water
+ *
+ * Inside the hull step range (2-7 deg).
+ *
+ * @unit deg
+ * @min -5.0
+ * @max 10.0
+ * @decimal 1
+ * @increment 0.5
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_PITCH, 4.0f);
+
+/**
+ * Water scoop: takeoff pitch from the water
+ *
+ * @unit deg
+ * @min 0.0
+ * @max 15.0
+ * @decimal 1
+ * @increment 0.5
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_TO_PITCH, 6.0f);
+
+/**
+ * Water scoop: upper limit of the scoop airspeed band
+ *
+ * The tank only fills between the item's lower limit (param4) and this (water_tank.txt speed_max).
+ *
+ * @unit m/s
+ * @min 10.0
+ * @max 50.0
+ * @decimal 1
+ * @increment 0.1
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_VMAX, 27.5f);
+
+/**
+ * Water scoop: throttle proportional gain on the airspeed error while scooping
+ *
+ * @min 0.0
+ * @max 1.0
+ * @decimal 3
+ * @increment 0.01
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_TKP, 0.10f);
+
+/**
+ * Water scoop: throttle integral gain on the airspeed error while scooping
+ *
+ * @min 0.0
+ * @max 1.0
+ * @decimal 3
+ * @increment 0.01
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_TKI, 0.05f);
+
+/**
+ * Water scoop: go-around height above the water
+ *
+ * After an abort the aircraft climbs straight to this height, then holds (AUTO.LOITER); the planner decides.
+ *
+ * @unit m
+ * @min 20.0
+ * @max 300.0
+ * @decimal 0
+ * @increment 5
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_GA_ALT, 60.0f);
+
+/**
+ * Water scoop gate: largest cross-track error at the flare start
+ *
+ * @unit m
+ * @min 1.0
+ * @max 100.0
+ * @decimal 1
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_G_XTRK, 15.0f);
+
+/**
+ * Water scoop gate: largest course error at the flare start
+ *
+ * @unit deg
+ * @min 0.5
+ * @max 45.0
+ * @decimal 1
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_G_CRS, 3.0f);
+
+/**
+ * Water scoop gate: largest roll angle at the flare start
+ *
+ * @unit deg
+ * @min 0.5
+ * @max 30.0
+ * @decimal 1
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_G_ROLL, 3.0f);
+
+/**
+ * Water scoop gate: largest airspeed error at the flare start
+ *
+ * @unit m/s
+ * @min 0.5
+ * @max 10.0
+ * @decimal 1
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_G_SPD, 2.0f);
+
+/**
+ * Water scoop: go-around above this roll angle during the flare
+ *
+ * @unit deg
+ * @min 1.0
+ * @max 30.0
+ * @decimal 1
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_A_ROLL, 5.0f);
+
+/**
+ * Water scoop: go-around above this cross-track error during the flare
+ *
+ * @unit m
+ * @min 1.0
+ * @max 100.0
+ * @decimal 1
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_A_XTRK, 20.0f);
+
+/**
+ * Water scoop: own go-around checks only above this height (below it the touchdown comes first)
+ *
+ * @unit m
+ * @min 0.0
+ * @max 10.0
+ * @decimal 1
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_A_HMIN, 1.0f);
+
+/**
+ * Water scoop: go-around after this long out of the abort band (FW_SC_A_VMIN..FW_SC_A_VMAX) once scooping started
+ *
+ * @unit s
+ * @min 0.5
+ * @max 30.0
+ * @decimal 1
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_OOB_T, 3.0f);
+
+/**
+ * Water scoop: go-around when the scoop phase lasts this much longer than the item duration
+ *
+ * @unit s
+ * @min 1.0
+ * @max 120.0
+ * @decimal 0
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_T_MARG, 15.0f);
+
+/**
+ * Water scoop: the scoop is done this high over the water after the takeoff
+ *
+ * @unit m
+ * @min 3.0
+ * @max 200.0
+ * @decimal 0
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_DONE_H, 20.0f);
+
+/**
+ * Water scoop: climb height over the water while the navigator is still on a water waypoint
+ *
+ * @unit m
+ * @min 5.0
+ * @max 300.0
+ * @decimal 0
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_CLB_H, 30.0f);
+
+/**
+ * Water scoop: go-around from the water with direct takeoff pitch/throttle up to this height, then the altitude controller
+ *
+ * @unit m
+ * @min 1.0
+ * @max 50.0
+ * @decimal 0
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_GA_H, 10.0f);
+
+/**
+ * Flare law 6 touchdown: range finder reading below this
+ *
+ * @unit m
+ * @min 0.1
+ * @max 5.0
+ * @decimal 2
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_TD_RNG, 1.2f);
+
+/**
+ * Flare law 6 touchdown: sink rate below this
+ *
+ * @unit m/s
+ * @min 0.05
+ * @max 2.0
+ * @decimal 2
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_TD_VZ, 0.35f);
+
+/**
+ * Flare law 6 touchdown: both conditions held this long
+ *
+ * @unit s
+ * @min 0.05
+ * @max 5.0
+ * @decimal 2
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_TD_T, 0.5f);
+
+/**
+ * Flare law 6 stall speed estimate: samples only above this height (ground effect)
+ *
+ * @unit m
+ * @min 0.0
+ * @max 500.0
+ * @decimal 0
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_VS_HMIN, 20.0f);
+
+/**
+ * Flare law 6 stall speed estimate: samples only below this roll angle
+ *
+ * @unit deg
+ * @min 1.0
+ * @max 30.0
+ * @decimal 1
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_VS_ROLL, 5.0f);
+
+/**
+ * Flare law 6 stall speed estimate: samples only after this long wings level
+ *
+ * @unit s
+ * @min 0.0
+ * @max 30.0
+ * @decimal 1
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_VS_LVL, 2.0f);
+
+/**
+ * Flare law 6 stall speed estimate: filter time constant (also the settling time)
+ *
+ * @unit s
+ * @min 0.5
+ * @max 60.0
+ * @decimal 1
+ * @group FW Auto Landing
+ */
+PARAM_DEFINE_FLOAT(FW_LND_VS_TAU, 5.0f);
+
+/**
+ * Water scoop: airspeed prediction time for the throttle
+ *
+ * The throttle works on the airspeed predicted this far ahead (filtered airspeed rate), so it opens while still
+ * decelerating towards the band (water_leg THROTTLE_LOOKAHEAD_S).
+ *
+ * @unit s
+ * @min 0.0
+ * @max 10.0
+ * @decimal 1
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_LOOK, 2.5f);
+
+/**
+ * Water scoop: throttle feedforward on the water at FW_SC_FF_VS stall speed
+ *
+ * Throttle that holds about 25 m/s on the water (water_leg THROTTLE_BASE, 800 kg); scaled with (Vs_est / FW_SC_FF_VS)^2.
+ *
+ * @min 0.0
+ * @max 1.0
+ * @decimal 2
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_THR_FF, 0.70f);
+
+/**
+ * Water scoop: stall speed at which FW_SC_THR_FF holds the scoop airspeed
+ *
+ * @unit m/s
+ * @min 1.0
+ * @max 60.0
+ * @decimal 1
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_FF_VS, 21.6f);
+
+/**
+ * Water scoop: fill rate for the momentum drag feedforward
+ *
+ * Scooped water is brought to the aircraft speed: drag fill_rate x v (water_tank.txt fill_rate).
+ *
+ * @min 0.0
+ * @max 500.0
+ * @decimal 1
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_FILL, 40.0f);
+
+/**
+ * Water scoop: maximum thrust (thrust proportional to throttle squared)
+ *
+ * @unit N
+ * @min 1.0
+ * @max 100000.0
+ * @decimal 0
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_TMAX, 5002.0f);
+
+/**
+ * Water scoop: pitch feedforward per unit throttle above the feedforward throttle
+ *
+ * The thrust line is above the CG: more throttle pitches the nose down, the pitch command is raised accordingly.
+ *
+ * @unit deg
+ * @min -10.0
+ * @max 10.0
+ * @decimal 1
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_P_THR, 4.0f);
+
+/**
+ * Water scoop: height over the water at which the takeoff run hands over to the climb
+ *
+ * Below it the takeoff run is flown with direct pitch and throttle; above it TECS climbs at the trim airspeed to
+ * FW_SC_DONE_H (no step at the end of the scoop).
+ *
+ * @unit m
+ * @min 0.5
+ * @max 20.0
+ * @decimal 1
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_LIFT_H, 2.0f);
+
+/**
+ * Water scoop: airspeed setpoint decrease after liftoff
+ *
+ * The climb starts at the liftoff airspeed and slows to the trim airspeed at this rate.
+ *
+ * @unit m/s^2
+ * @min 0.1
+ * @max 5.0
+ * @decimal 1
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_CLB_DEC, 1.0f);
+
+/**
+ * Water scoop: low speed guard margin
+ *
+ * Full throttle while the predicted airspeed is less than this above the band floor (item param4).
+ *
+ * @unit m/s
+ * @min 0.0
+ * @max 5.0
+ * @decimal 1
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_V_MARG, 0.8f);
+
+/**
+ * Water scoop: abort band lower limit
+ *
+ * The throttle keeps the airspeed in the control band (item param4 .. FW_SC_VMAX, 80-100 km/h); only leaving this
+ * wider abort band for longer than FW_SC_OOB_T aborts the scoop. 19.44 m/s = 70 km/h (user).
+ *
+ * @unit m/s
+ * @min 10.0
+ * @max 50.0
+ * @decimal 2
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_A_VMIN, 19.44f);
+
+/**
+ * Water scoop: abort band upper limit
+ *
+ * 34.72 m/s = 125 km/h (user).
+ *
+ * @unit m/s
+ * @min 10.0
+ * @max 60.0
+ * @decimal 2
+ * @group FW Water Scoop
+ */
+PARAM_DEFINE_FLOAT(FW_SC_A_VMAX, 34.72f);

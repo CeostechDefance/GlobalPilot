@@ -58,6 +58,8 @@ void CombinedControllerConfigurationHandler::update(const hrt_abstime now)
 				 _longitudinal_publisher.get().climb_rate_target);
 	_longitudinal_updated |= floatValueChanged(_longitudinal_configuration_current_cycle.sink_rate_target,
 				 _longitudinal_publisher.get().sink_rate_target);
+	_longitudinal_updated |= floatValueChanged(_longitudinal_configuration_current_cycle.equivalent_airspeed_min,
+				 _longitudinal_publisher.get().equivalent_airspeed_min);
 	_longitudinal_updated |= booleanValueChanged(_longitudinal_configuration_current_cycle.enforce_low_height_condition,
 				 _longitudinal_publisher.get().enforce_low_height_condition);
 	_longitudinal_updated |= booleanValueChanged(_longitudinal_configuration_current_cycle.disable_underspeed_protection,
@@ -116,6 +118,11 @@ void CombinedControllerConfigurationHandler::setClimbRateTarget(float climbrate_
 void CombinedControllerConfigurationHandler::setDisableUnderspeedProtection(bool disable)
 {
 	_longitudinal_configuration_current_cycle.disable_underspeed_protection = disable;
+}
+
+void CombinedControllerConfigurationHandler::setEquivalentAirspeedMin(float airspeed_min)
+{
+	_longitudinal_configuration_current_cycle.equivalent_airspeed_min = airspeed_min;
 }
 
 void CombinedControllerConfigurationHandler::setSinkRateTarget(const float sinkrate_target)

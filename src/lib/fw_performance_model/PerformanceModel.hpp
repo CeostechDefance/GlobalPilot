@@ -71,6 +71,12 @@ public:
 	float getWeightRatio() const;
 
 	/**
+	 * Use an in-flight weight estimate instead of WEIGHT_GROSS (FW_WE_EN).
+	 * @param weight_ratio estimated weight / WEIGHT_BASE, NAN to use WEIGHT_GROSS again
+	 */
+	void setWeightRatioOverride(float weight_ratio) { _weight_ratio_override = weight_ratio; }
+
+	/**
 	 * Get the trim throttle for the current airspeed setpoint as well as air density and weight.
 	 * @param throttle_min minimum throttle in range [0,1]
 	 * @param throttle_max maximum throttle in range [0,1]
@@ -122,6 +128,8 @@ public:
 	bool runSanityChecks() const;
 
 private:
+	float _weight_ratio_override{NAN};
+
 	DEFINE_PARAMETERS(
 		(ParamFloat<px4::params::FW_AIRSPD_MAX>) _param_fw_airspd_max,
 		(ParamFloat<px4::params::FW_AIRSPD_MIN>) _param_fw_airspd_min,

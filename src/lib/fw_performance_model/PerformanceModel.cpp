@@ -62,7 +62,10 @@ float PerformanceModel::getWeightRatio() const
 {
 	float weight_factor = 1.0f;
 
-	if (_param_weight_base.get() > FLT_EPSILON && _param_weight_gross.get() > FLT_EPSILON) {
+	if (PX4_ISFINITE(_weight_ratio_override)) {
+		weight_factor = math::constrain(_weight_ratio_override, kMinWeightRatio, kMaxWeightRatio);
+
+	} else if (_param_weight_base.get() > FLT_EPSILON && _param_weight_gross.get() > FLT_EPSILON) {
 		weight_factor = math::constrain(_param_weight_gross.get() / _param_weight_base.get(), kMinWeightRatio,
 						kMaxWeightRatio);
 	}

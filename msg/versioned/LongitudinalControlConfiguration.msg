@@ -14,4 +14,5 @@ float32 climb_rate_target 		# [m/s] target climbrate to change altitude. Default
 float32 sink_rate_target 		# [m/s] target sinkrate to change altitude. Defaults to FW_T_SINK_MAX if NAN. Not used if height_rate is directly set in FixedWingLongitudinalSetpoint.
 float32 speed_weight 			# [@range 0,2], 0=pitch controls altitude only, 2=pitch controls airspeed only
 bool enforce_low_height_condition 	# [boolean] if true, the altitude controller is configured with an alternative timeconstant for tighter altitude tracking
+float32 equivalent_airspeed_min	# [m/s] lower airspeed limit (landing with estimated stall speed, flare law 6). Defaults to the performance model minimum if NAN.
 bool disable_underspeed_protection 	# [boolean] if true, underspeed handling is disabled in the altitude controller

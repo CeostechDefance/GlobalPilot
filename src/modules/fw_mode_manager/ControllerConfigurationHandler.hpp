@@ -43,7 +43,7 @@
 #include <uORB/Publication.hpp>
 #include <lib/mathlib/mathlib.h>
 
-static constexpr longitudinal_control_configuration_s empty_longitudinal_control_configuration = {.timestamp = 0, .pitch_min = NAN, .pitch_max = NAN, .throttle_min = NAN, .throttle_max = NAN, .climb_rate_target = NAN, .sink_rate_target = NAN, .speed_weight = NAN, .enforce_low_height_condition = false, .disable_underspeed_protection = false };
+static constexpr longitudinal_control_configuration_s empty_longitudinal_control_configuration = {.timestamp = 0, .pitch_min = NAN, .pitch_max = NAN, .throttle_min = NAN, .throttle_max = NAN, .climb_rate_target = NAN, .sink_rate_target = NAN, .speed_weight = NAN, .equivalent_airspeed_min = NAN, .enforce_low_height_condition = false, .disable_underspeed_protection = false };
 static constexpr lateral_control_configuration_s empty_lateral_control_configuration = {.timestamp = 0, .lateral_accel_max = NAN};
 
 
@@ -71,11 +71,18 @@ public:
 
 	void setDisableUnderspeedProtection(bool disable);
 
+	void setEquivalentAirspeedMin(float airspeed_min);
+
 	void setSinkRateTarget(const float sinkrate_target);
 
 	void setLateralAccelMax(float lateral_accel_max);
 
 	void resetLastPublishTime();
+
+	// limits set in the current cycle, NAN if not set (the controller then uses its parameter default)
+	float getPitchMin() const { return _longitudinal_configuration_current_cycle.pitch_min; }
+	float getThrottleMin() const { return _longitudinal_configuration_current_cycle.throttle_min; }
+	float getThrottleMax() const { return _longitudinal_configuration_current_cycle.throttle_max; }
 
 private:
 	bool booleanValueChanged(bool new_value, bool current_value)

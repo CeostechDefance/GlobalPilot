@@ -282,3 +282,88 @@ PARAM_DEFINE_FLOAT(FW_WIND_ARSP_SC, 0.f);
  * @group FW Longitudinal Control
  */
 PARAM_DEFINE_FLOAT(FW_T_SINK_MAX, 5.0f);
+
+/**
+ * In-flight weight estimate
+ *
+ * 1: in steady wings level flight the weight is estimated from lift = weight cos(roll), with CL from the synthetic
+ * angle of attack (pitch - flight path angle) and the flap setpoint (FW_WE_CL0/CLF/CLA, wing area FW_WE_AREA), filtered
+ * with 10 s, bounded to FW_WE_MMIN..FW_WE_MMAX. It replaces WEIGHT_GROSS for the weight scaled airspeeds (trim, minimum,
+ * stall) and climb/sink limits. On the ground WEIGHT_GROSS is used and the estimate restarts after takeoff.
+ *
+ * @value 0 Disabled (WEIGHT_GROSS)
+ * @value 1 Enabled
+ * @group FW Longitudinal Control
+ */
+PARAM_DEFINE_INT32(FW_WE_EN, 0);
+
+/**
+ * Weight estimate: lift coefficient at zero synthetic angle of attack, flaps retracted
+ *
+ * @min 0.0
+ * @max 2.0
+ * @decimal 3
+ * @increment 0.01
+ * @group FW Longitudinal Control
+ */
+PARAM_DEFINE_FLOAT(FW_WE_CL0, 0.73f);
+
+/**
+ * Weight estimate: lift coefficient increase at full flap setpoint
+ *
+ * Added linearly with the normalized flap setpoint (0..1).
+ *
+ * @min 0.0
+ * @max 2.0
+ * @decimal 3
+ * @increment 0.01
+ * @group FW Longitudinal Control
+ */
+PARAM_DEFINE_FLOAT(FW_WE_CLF, 0.31f);
+
+/**
+ * Weight estimate: lift curve slope per radian
+ *
+ * @min 1.0
+ * @max 8.0
+ * @decimal 2
+ * @increment 0.05
+ * @group FW Longitudinal Control
+ */
+PARAM_DEFINE_FLOAT(FW_WE_CLA, 4.7f);
+
+/**
+ * Weight estimate: wing reference area
+ *
+ * @unit m^2
+ * @min 0.1
+ * @max 100.0
+ * @decimal 2
+ * @increment 0.1
+ * @group FW Longitudinal Control
+ */
+PARAM_DEFINE_FLOAT(FW_WE_AREA, 15.0f);
+
+/**
+ * Weight estimate: minimum mass
+ *
+ * @unit kg
+ * @min 0.0
+ * @max 100000.0
+ * @decimal 0
+ * @increment 10
+ * @group FW Longitudinal Control
+ */
+PARAM_DEFINE_FLOAT(FW_WE_MMIN, 750.0f);
+
+/**
+ * Weight estimate: maximum mass
+ *
+ * @unit kg
+ * @min 0.0
+ * @max 100000.0
+ * @decimal 0
+ * @increment 10
+ * @group FW Longitudinal Control
+ */
+PARAM_DEFINE_FLOAT(FW_WE_MMAX, 1200.0f);

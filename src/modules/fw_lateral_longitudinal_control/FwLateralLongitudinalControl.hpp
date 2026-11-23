@@ -126,6 +126,7 @@ private:
 	vehicle_local_position_s _local_pos{};
 	fixed_wing_longitudinal_setpoint_s _long_control_sp{empty_longitudinal_control_setpoint};
 	longitudinal_control_configuration_s _long_configuration{};
+	bool _tecs_airspeed_min_overridden{false};
 	fixed_wing_lateral_setpoint_s _lat_control_sp{empty_lateral_control_setpoint};
 	lateral_control_configuration_s _lateral_configuration{};
 
@@ -137,6 +138,14 @@ private:
 	uORB::Publication <fixed_wing_lateral_status_s> _fixed_wing_lateral_status_pub{ORB_ID(fixed_wing_lateral_status)};
 
 	DEFINE_PARAMETERS(
+		(ParamInt<px4::params::FW_WE_EN>) _param_fw_we_en,
+		(ParamFloat<px4::params::FW_WE_CL0>) _param_fw_we_cl0,
+		(ParamFloat<px4::params::FW_WE_CLF>) _param_fw_we_clf,
+		(ParamFloat<px4::params::FW_WE_CLA>) _param_fw_we_cla,
+		(ParamFloat<px4::params::FW_WE_AREA>) _param_fw_we_area,
+		(ParamFloat<px4::params::FW_WE_MMIN>) _param_fw_we_mmin,
+		(ParamFloat<px4::params::FW_WE_MMAX>) _param_fw_we_mmax,
+		(ParamFloat<px4::params::WEIGHT_BASE>) _param_weight_base,
 		(ParamFloat<px4::params::FW_PSP_OFF>) _param_fw_psp_off,
 		(ParamBool<px4::params::FW_USE_AIRSPD>) _param_fw_use_airspd,
 		(ParamFloat<px4::params::NAV_FW_ALT_RAD>) _param_nav_fw_alt_rad,
@@ -192,6 +201,17 @@ private:
 	hrt_abstime _time_wind_last_received{0};
 	SlewRate<float> _roll_slew_rate;
 	float _yaw{0.f};
+	float _roll{0.f};
+
+	// in-flight weight estimate (FW_WE_EN): lift = weight cos(roll) in steady flight, CL from the synthetic angle of
+	// attack (pitch - flight path angle) and the flap setpoint
+	float _weight_est_kg{NAN};
+	float _weight_est_settled{0.f}; // [s] filtered time
+	float _weight_ratio_applied{NAN}; // ratio last handed to the performance model and TECS
+	hrt_abstime _weight_est_last_sample{0};
+	hrt_abstime _weight_est_level_since{0};
+	hrt_abstime _weight_est_last_info{0};
+	float _true_airspeed{NAN};
 	struct lateral_control_state {
 		matrix::Vector2f ground_speed;
 		matrix::Vector2f wind_speed;
@@ -225,6 +245,16 @@ private:
 				 float throttle_trim);
 
 	void updateAirspeed();
+
+	/**
+	 * In-flight weight estimate (FW_WE_EN 1); hands weight / WEIGHT_BASE to the performance model and TECS.
+	 */
+	void updateWeightEstimate(const hrt_abstime now);
+
+	/**
+	 * TECS limits that depend on the weight ratio (after a weight estimate change).
+	 */
+	void updateWeightDependentTecsLimits();
 
 	void updateAttitude();
 

@@ -148,7 +148,19 @@ void FwLateralLongitudinalControl::Run()
 
 		updateControllerConfiguration();
 
+		updateWeightEstimate(_local_pos.timestamp);
+
 		_tecs.set_speed_weight(_long_configuration.speed_weight);
+
+		// the mode manager may lower the minimum airspeed (landing with an estimated stall speed); restore when released
+		if (PX4_ISFINITE(_long_configuration.equivalent_airspeed_min)) {
+			_tecs.set_equivalent_airspeed_min(_long_configuration.equivalent_airspeed_min);
+			_tecs_airspeed_min_overridden = true;
+
+		} else if (_tecs_airspeed_min_overridden) {
+			_tecs.set_equivalent_airspeed_min(_performance_model.getMinimumCalibratedAirspeed(getLoadFactor(), _flaps_setpoint));
+			_tecs_airspeed_min_overridden = false;
+		}
 		updateTECSAltitudeTimeConstant(checkLowHeightConditions()
 					       || _long_configuration.enforce_low_height_condition, control_interval);
 		_tecs.set_altitude_error_time_constant(_tecs_alt_time_const_slew_rate.getState());
@@ -593,6 +605,7 @@ void FwLateralLongitudinalControl::updateAttitude() {
 		const Eulerf euler_angles(R);
 		_long_control_state.pitch_rad = euler_angles.theta();
 		_yaw = euler_angles.psi();
+		_roll = euler_angles.phi();
 
 		// load factor due to banking
 		const float load_factor_from_bank_angle = 1.0f / max(cosf(euler_angles.phi()), FLT_EPSILON);
@@ -613,6 +626,7 @@ void FwLateralLongitudinalControl::updateAirspeed() {
 
 			_time_airspeed_last_valid = airspeed_validated.timestamp;
 			_long_control_state.airspeed_eas = airspeed_validated.calibrated_airspeed_m_s;
+			_true_airspeed = airspeed_validated.true_airspeed_m_s;
 			_long_control_state.eas2tas = constrain(airspeed_validated.true_airspeed_m_s / airspeed_validated.calibrated_airspeed_m_s, 0.9f, 2.0f);
 		}
 	}
@@ -631,7 +645,9 @@ float
 FwLateralLongitudinalControl::adapt_airspeed_setpoint(const float control_interval, float calibrated_airspeed_setpoint,
 		float calibrated_min_airspeed_guidance, float wind_speed)
 {
-	float system_min_airspeed = _performance_model.getMinimumCalibratedAirspeed(getLoadFactor(), _flaps_setpoint);
+	float system_min_airspeed = PX4_ISFINITE(_long_configuration.equivalent_airspeed_min) ?
+				    _long_configuration.equivalent_airspeed_min :
+				    _performance_model.getMinimumCalibratedAirspeed(getLoadFactor(), _flaps_setpoint);
 
 	const float system_max_airspeed = _performance_model.getMaximumCalibratedAirspeed();
 
@@ -789,10 +805,15 @@ void FwLateralLongitudinalControl::setDefaultLongitudinalControlConfiguration() 
 	_long_configuration.sink_rate_target = _param_sinkrate_target.get();
 	_long_configuration.disable_underspeed_protection = false;
 	_long_configuration.enforce_low_height_condition = false;
+	_long_configuration.equivalent_airspeed_min = NAN;
 }
 
 void FwLateralLongitudinalControl::updateLongitudinalControlConfiguration(const longitudinal_control_configuration_s &configuration_in) {
 	_long_configuration.timestamp = configuration_in.timestamp;
+
+	// lower airspeed limit from the mode manager (landing with an estimated stall speed), NAN: performance model
+	_long_configuration.equivalent_airspeed_min = (PX4_ISFINITE(configuration_in.equivalent_airspeed_min)
+			&& configuration_in.equivalent_airspeed_min > 5.0f) ? configuration_in.equivalent_airspeed_min : NAN;
 
 	if (PX4_ISFINITE(configuration_in.pitch_min)) {
 		_long_configuration.pitch_min = math::constrain(configuration_in.pitch_min, radians(_param_fw_p_lim_min.get()), radians(_param_fw_p_lim_max.get()));
@@ -853,4 +874,97 @@ float FwLateralLongitudinalControl::getLoadFactor() const
 extern "C" __EXPORT int fw_lat_lon_control_main(int argc, char *argv[])
 {
 	return FwLateralLongitudinalControl::main(argc, argv);
+}
+
+void FwLateralLongitudinalControl::updateWeightEstimate(const hrt_abstime now)
+{
+	if (_param_fw_we_en.get() != 1 || _param_weight_base.get() < FLT_EPSILON) {
+		if (PX4_ISFINITE(_weight_ratio_applied)) {
+			_performance_model.setWeightRatioOverride(NAN);
+			_weight_ratio_applied = NAN;
+			updateWeightDependentTecsLimits();
+		}
+
+		_weight_est_kg = NAN;
+		_weight_est_settled = 0.f;
+		return;
+	}
+
+	// on the ground (or water) the weight may change (fuel, scooped water): start over after the next takeoff and
+	// meanwhile use WEIGHT_GROSS (also written by the mission scripts)
+	if (_landed) {
+		_weight_est_kg = NAN;
+		_weight_est_settled = 0.f;
+		_weight_est_last_sample = 0;
+		_weight_est_level_since = 0;
+
+		if (PX4_ISFINITE(_weight_ratio_applied)) {
+			_performance_model.setWeightRatioOverride(NAN);
+			_weight_ratio_applied = NAN;
+			updateWeightDependentTecsLimits();
+		}
+
+		return;
+	}
+
+	// samples only after 2 s wings level, clear of ground effect, with a valid airspeed
+	if (fabsf(_roll) > radians(5.f) || _weight_est_level_since == 0) {
+		_weight_est_level_since = now;
+	}
+
+	const bool airspeed_ok = hrt_elapsed_time(&_time_airspeed_last_valid) < 1_s && PX4_ISFINITE(_true_airspeed);
+	const bool high_enough = !_local_pos.dist_bottom_valid || _local_pos.dist_bottom > 20.f;
+
+	if (airspeed_ok && high_enough && _long_control_state.airspeed_eas > 15.f && fabsf(_local_pos.vz) < 4.f
+	    && now > _weight_est_level_since + 2_s) {
+		const float flight_path_angle = asinf(math::constrain(-_local_pos.vz / math::max(_true_airspeed, 1.f), -0.5f, 0.5f));
+		const float alpha = _long_control_state.pitch_rad - flight_path_angle;
+		const float flaps = PX4_ISFINITE(_flaps_setpoint) ? _flaps_setpoint : 0.f;
+		const float cl = math::constrain(_param_fw_we_cl0.get() + _param_fw_we_clf.get() * flaps
+						 + _param_fw_we_cla.get() * alpha, 0.1f, 3.f);
+		// lift = weight cos(roll), dynamic pressure from the equivalent airspeed
+		const float q = 0.5f * atmosphere::kAirDensitySeaLevelStandardAtmos * _long_control_state.airspeed_eas *
+				_long_control_state.airspeed_eas;
+		const float mass_sample = math::constrain(q * _param_fw_we_area.get() * cl * cosf(_roll) / CONSTANTS_ONE_G,
+					  0.5f * _param_fw_we_mmin.get(), 1.5f * _param_fw_we_mmax.get());
+		const float dt = (_weight_est_last_sample > 0) ? math::constrain((now - _weight_est_last_sample) * 1e-6f, 0.f, 0.5f) : 0.f;
+		_weight_est_last_sample = now;
+
+		if (!PX4_ISFINITE(_weight_est_kg)) {
+			_weight_est_kg = mass_sample;
+
+		} else {
+			// first order filter, 10 s time constant
+			_weight_est_kg += (mass_sample - _weight_est_kg) * math::min(dt / 10.f, 1.f);
+			_weight_est_settled += dt;
+		}
+	}
+
+	if (PX4_ISFINITE(_weight_est_kg) && _weight_est_settled >= 5.f) {
+		const float mass = math::constrain(_weight_est_kg, _param_fw_we_mmin.get(), _param_fw_we_mmax.get());
+		const float ratio = mass / _param_weight_base.get();
+
+		// hand over in 1 % steps: the TECS limits are recomputed on every change
+		if (!PX4_ISFINITE(_weight_ratio_applied) || fabsf(ratio - _weight_ratio_applied) > 0.01f) {
+			_performance_model.setWeightRatioOverride(ratio);
+			_weight_ratio_applied = ratio;
+			updateWeightDependentTecsLimits();
+		}
+
+		if (hrt_elapsed_time(&_weight_est_last_info) > 30_s) {
+			_weight_est_last_info = now;
+			PX4_INFO("weight estimate %.0f kg (ratio %.2f)", (double)mass, (double)ratio);
+		}
+	}
+}
+
+void FwLateralLongitudinalControl::updateWeightDependentTecsLimits()
+{
+	_tecs.set_max_climb_rate(_performance_model.getMaximumClimbRate(_air_density));
+	_tecs.set_min_sink_rate(_performance_model.getMinimumSinkRate(_air_density));
+	_tecs.set_equivalent_airspeed_trim(_performance_model.getCalibratedTrimAirspeed());
+
+	if (!_tecs_airspeed_min_overridden) {
+		_tecs.set_equivalent_airspeed_min(_performance_model.getMinimumCalibratedAirspeed(getLoadFactor(), _flaps_setpoint));
+	}
 }

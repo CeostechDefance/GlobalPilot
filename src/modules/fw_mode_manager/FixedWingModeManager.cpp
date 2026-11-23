@@ -130,13 +130,61 @@ FixedWingModeManager::vehicle_command_poll()
 
 	while (_vehicle_command_sub.update(&vehicle_command)) {
 		if (vehicle_command.command == vehicle_command_s::VEHICLE_CMD_DO_GO_AROUND) {
+			bool accepted = false;
+
+			// water scoop: any phase up to the takeoff can be aborted by the planner / operator
+			if (_scoop.phase >= ScoopPhase::APPROACH && _scoop.phase <= ScoopPhase::TAKEOFF) {
+				scoopAbort(hrt_absolute_time(), "OPERATOR");
+				accepted = true;
+
 			// only abort landing before point of no return (horizontal and vertical)
-			if (_control_mode.flag_control_auto_enabled &&
-			    _position_setpoint_current_valid &&
-			    (_pos_sp_triplet.current.type == position_setpoint_s::SETPOINT_TYPE_LAND)) {
+			} else if (_control_mode.flag_control_auto_enabled &&
+				   _position_setpoint_current_valid &&
+				   (_pos_sp_triplet.current.type == position_setpoint_s::SETPOINT_TYPE_LAND)) {
 
 				updateLandingAbortStatus(position_controller_landing_status_s::ABORTED_BY_OPERATOR);
+				accepted = true;
 			}
+
+			// commander leaves DO_GO_AROUND unacknowledged: answer here so the planner knows it arrived
+			vehicle_command_ack_s ack{};
+			ack.command = vehicle_command.command;
+			ack.result = accepted ? vehicle_command_ack_s::VEHICLE_CMD_RESULT_ACCEPTED : vehicle_command_ack_s::VEHICLE_CMD_RESULT_DENIED;
+			ack.target_system = vehicle_command.source_system;
+			ack.target_component = vehicle_command.source_component;
+			ack.timestamp = hrt_absolute_time();
+			_vehicle_command_ack_pub.publish(ack);
+
+		} else if (vehicle_command.command == 31010) {
+			// MAV_CMD_USER_1 water scoop (mission item or COMMAND_LONG): param1 1 arm / 0 disarm, param2 airspeed, param3
+			// duration, param4 lower band limit, param7 water surface AMSL
+			if (vehicle_command.param1 > 0.5f && PX4_ISFINITE(vehicle_command.param7)) {
+				_scoop = ScoopState{};
+				_scoop.armed = true;
+				_scoop.target_speed = (vehicle_command.param2 > 5.f) ? vehicle_command.param2 : 25.f;
+				_scoop.duration = (vehicle_command.param3 > 0.5f) ? vehicle_command.param3 : 10.f;
+				_scoop.speed_min = (vehicle_command.param4 > 5.f) ? vehicle_command.param4 : 22.22f;
+				_scoop.water_amsl = (float)vehicle_command.param7;
+				mavlink_log_info(&_mavlink_log_pub, "SU: KURULDU hiz=%.1f sure=%.0f bant=%.2f-%.2f su=%.1f\t",
+						 (double)_scoop.target_speed, (double)_scoop.duration, (double)_scoop.speed_min,
+						 (double)_param_fw_sc_vmax.get(), (double)_scoop.water_amsl);
+
+			} else {
+				if (_scoop.phase >= ScoopPhase::APPROACH && _scoop.phase <= ScoopPhase::TAKEOFF) {
+					scoopAbort(hrt_absolute_time(), "OPERATOR");
+				}
+
+				_scoop.armed = false;
+				mavlink_log_info(&_mavlink_log_pub, "SU: KAPATILDI\t");
+			}
+
+			vehicle_command_ack_s ack{};
+			ack.command = vehicle_command.command;
+			ack.result = vehicle_command_ack_s::VEHICLE_CMD_RESULT_ACCEPTED;
+			ack.target_system = vehicle_command.source_system;
+			ack.target_component = vehicle_command.source_component;
+			ack.timestamp = hrt_absolute_time();
+			_vehicle_command_ack_pub.publish(ack);
 
 		} else if (vehicle_command.command == vehicle_command_s::VEHICLE_CMD_DO_CHANGE_SPEED) {
 
@@ -169,6 +217,7 @@ FixedWingModeManager::airspeed_poll()
 		    && airspeed_validated.airspeed_source != airspeed_validated_s::SOURCE_SYNTHETIC) {
 
 			_airspeed_eas = airspeed_validated.calibrated_airspeed_m_s;
+			_time_airspeed_sample = hrt_absolute_time();
 		}
 	}
 
@@ -247,6 +296,8 @@ FixedWingModeManager::vehicle_attitude_poll()
 		}
 
 		const Eulerf euler_angles(R);
+		_pitch = euler_angles(1);
+		_roll = euler_angles(0);
 		_yaw = euler_angles(2);
 
 		const Vector3f body_acceleration = R.transpose() * Vector3f{_local_pos.ax, _local_pos.ay, _local_pos.az};
@@ -1141,6 +1192,13 @@ FixedWingModeManager::control_auto_takeoff(const hrt_abstime &now, const float c
 		_ctrl_configuration_handler.setClimbRateTarget(_param_fw_t_clmb_max.get());
 		_ctrl_configuration_handler.setDisableUnderspeedProtection(true);
 
+		if (_runway_takeoff.getState() == RunwayTakeoffState::CLIMBOUT) {
+			// limits to release gradually once the climbout ends (apply_takeoff_exit_blend)
+			_time_takeoff_climbout_last = now;
+			_takeoff_exit_pitch_min = pitch_min;
+			_takeoff_exit_throttle = _runway_takeoff.getThrottle(_param_fw_thr_idle.get());
+		}
+
 		_flaps_setpoint = _param_fw_flaps_to_scl.get();
 
 		// retract ladning gear once passed the climbout state
@@ -1387,8 +1445,8 @@ void
 FixedWingModeManager::control_auto_landing_straight(const hrt_abstime &now, const float control_interval,
 		const Vector2f &ground_speed, const position_setpoint_s &pos_sp_prev, const position_setpoint_s &pos_sp_curr)
 {
-	const float airspeed_land = (_param_fw_lnd_airspd.get() > FLT_EPSILON) ? _param_fw_lnd_airspd.get() :
-				    _param_fw_airspd_min.get();
+	float airspeed_land = (_param_fw_lnd_airspd.get() > FLT_EPSILON) ? _param_fw_lnd_airspd.get() :
+			      _param_fw_airspd_min.get();
 
 	_ctrl_configuration_handler.setEnforceLowHeightCondition(true);
 
@@ -1424,6 +1482,16 @@ FixedWingModeManager::control_auto_landing_straight(const hrt_abstime &now, cons
 	const float glide_slope_reference_alt = (_param_fw_lnd_useter.get() ==
 						TerrainEstimateUseOnLanding::kFollowTerrainRelativeLandingGlideSlope) ? terrain_alt : pos_sp_curr.alt;
 
+	// flare law 6: approach airspeed and lower airspeed limit from the estimated stall speed instead of the weight
+	if (_param_fw_lnd_fl_law.get() == 6) {
+		const float vs_est = updateStallSpeedEstimate(now, _current_altitude - terrain_alt);
+
+		if (PX4_ISFINITE(vs_est)) {
+			airspeed_land = _param_fw_lnd_vapp_k.get() * vs_est;
+			_ctrl_configuration_handler.setEquivalentAirspeedMin(1.05f * vs_est);
+		}
+	}
+
 	float altitude_setpoint;
 
 	if (_current_altitude > glide_slope_reference_alt + glide_slope_rel_alt) {
@@ -1448,6 +1516,28 @@ FixedWingModeManager::control_auto_landing_straight(const hrt_abstime &now, cons
 			_flare_states.flaring = true;
 			_flare_states.start_time = now;
 			_flare_states.initial_height_rate_setpoint = -_local_pos.vz;
+			_flare_states.start_height = _current_altitude - terrain_alt;
+			_flare_states.start_pitch = _pitch;
+			_flare_states.pitch_cmd = _pitch;
+			_flare_states.sink_rate_integral = 0.0f;
+			_flare_states.throttle_integral = 0.0f;
+			_flare_states.attitude_offset = 0.0f;
+			_flare_states.attitude_hold = false;
+			// law 5 starts from the feedforward throttle, law 4 from idle (its deceleration phase)
+			_flare_states.throttle_cmd = (_param_fw_lnd_fl_law.get() == 5) ? _param_fw_lnd_fl_tff.get() : _param_fw_thr_idle.get();
+
+			if (_param_fw_lnd_fl_law.get() == 6) {
+				// law 6 starts from the approach throttle (no step), around which the airspeed PI works
+				vehicle_thrust_setpoint_s thrust_sp{};
+				_flare_states.throttle_start = (_vehicle_thrust_setpoint_sub.copy(&thrust_sp) && PX4_ISFINITE(thrust_sp.xyz[0]))
+							       ? math::constrain(thrust_sp.xyz[0], _param_fw_thr_idle.get(), _param_fw_thr_max.get())
+							       : _param_fw_lnd_fl_tff.get();
+				_flare_states.throttle_cmd = _flare_states.throttle_start;
+				_flare_states.start_airspeed = _airspeed_eas;
+				_flare_states.touchdown = false;
+				_flare_states.touchdown_timer = 0.0f;
+			}
+			_flare_states.last_update = now;
 			events::send(events::ID("fixedwing_position_control_landing_flaring"), events::Log::Info,
 				     "Landing, flaring");
 		}
@@ -1482,13 +1572,50 @@ FixedWingModeManager::control_auto_landing_straight(const hrt_abstime &now, cons
 				_param_fw_lnd_fl_time.get()) / (_param_fw_lnd_fl_time.get()), 0.f, 1.f);
 		const float flare_hieght_rate_interpolator_sqrt = sqrt(flare_hieght_rate_interpolator);
 
-		const float height_rate_setpoint = flare_hieght_rate_interpolator_sqrt * (-_param_fw_lnd_fl_sink.get()) +
-						   (1.0f - flare_hieght_rate_interpolator_sqrt) * _flare_states.initial_height_rate_setpoint;
+		float height_rate_setpoint = flare_hieght_rate_interpolator_sqrt * (-_param_fw_lnd_fl_sink.get()) +
+					     (1.0f - flare_hieght_rate_interpolator_sqrt) * _flare_states.initial_height_rate_setpoint;
 
-		float pitch_min_rad = flare_ramp_interpolator_sqrt * radians(_param_fw_lnd_fl_pmin.get()) +
-				      (1.0f - flare_ramp_interpolator_sqrt) * radians(_param_fw_p_lim_min.get());
-		float pitch_max_rad = flare_ramp_interpolator_sqrt * radians(_param_fw_lnd_fl_pmax.get()) +
-				      (1.0f - flare_ramp_interpolator_sqrt) * radians(_param_fw_p_lim_max.get());
+		// interpolator for the pitch limits: 0 at flare start, 1 at touchdown values
+		float flare_limit_interpolator = flare_ramp_interpolator_sqrt;
+
+		const int flare_law = _param_fw_lnd_fl_law.get();
+
+		if (flare_law == 1 || flare_law == 2 || flare_law == 3) {
+			// height based flare: sink rate, limits and throttle follow the height above the touchdown point
+			// instead of the time since flare start (exponential flare / constant deceleration flare)
+			const float sink_td = math::max(_param_fw_lnd_fl_sink.get(), 0.0f);
+			const float sink_start = math::max(-_flare_states.initial_height_rate_setpoint, sink_td);
+			const float hold_height = math::max(_param_fw_lnd_fl_hold.get(), 0.0f);
+			const float flare_span = math::max(_flare_states.start_height - hold_height, 0.1f);
+			// 1 at flare start, 0 at and below the hold-off height
+			const float height_fraction = math::constrain((_current_altitude - terrain_alt - hold_height) / flare_span, 0.0f,
+						      1.0f);
+
+			float sink_rate;
+
+			if (flare_law == 1 || flare_law == 3) {
+				// sink rate linear in height -> height decays exponentially in time
+				sink_rate = sink_td + (sink_start - sink_td) * height_fraction;
+
+			} else {
+				// constant vertical deceleration: sink^2 linear in height -> sink rate linear in time
+				sink_rate = sqrtf(sink_td * sink_td + (sink_start * sink_start - sink_td * sink_td) * height_fraction);
+			}
+
+			height_rate_setpoint = -sink_rate;
+			flare_limit_interpolator = 1.0f - height_fraction;
+
+			// with idle throttle the airspeed falls below the landing airspeed during the flare; a reduced speed
+			// weight lets pitch follow the sink rate instead of trying to regain airspeed (as ArduPlane LAND_SPDWGT)
+			if (_param_fw_lnd_fl_spdw.get() >= 0.0f) {
+				_ctrl_configuration_handler.setSpeedWeight(math::constrain(_param_fw_lnd_fl_spdw.get(), 0.0f, 2.0f));
+			}
+		}
+
+		float pitch_min_rad = flare_limit_interpolator * radians(_param_fw_lnd_fl_pmin.get()) +
+				      (1.0f - flare_limit_interpolator) * radians(_param_fw_p_lim_min.get());
+		float pitch_max_rad = flare_limit_interpolator * radians(_param_fw_lnd_fl_pmax.get()) +
+				      (1.0f - flare_limit_interpolator) * radians(_param_fw_p_lim_max.get());
 
 		if (_param_fw_lnd_td_time.get() > FLT_EPSILON) {
 			const float touchdown_time = math::max(_param_fw_lnd_td_time.get(), _param_fw_lnd_fl_time.get());
@@ -1505,24 +1632,288 @@ FixedWingModeManager::control_auto_landing_straight(const hrt_abstime &now, cons
 
 		// idle throttle may be >0 for internal combustion engines
 		// normally set to zero for electric motors
+		// throttle is retarded to idle over FW_LND_FL_TIME with every flare law, so airspeed bleeds off during the flare
 		const float throttle_max = flare_ramp_interpolator_sqrt * _param_fw_thr_idle.get() +
 					   (1.0f - flare_ramp_interpolator_sqrt) *
 					   _param_fw_thr_max.get();
+
+		float pitch_direct = NAN;
+		float throttle_direct = NAN;
+
+		if (flare_law == 6) {
+			// same algorithm as the water scoop (law6Step), runway profile: retard and runway pitch after touchdown
+			const Law6Profile runway_profile{_param_fw_lnd_vtd_k.get(), radians(_param_fw_lnd_fl_pmax.get()), false};
+			const Law6Output out = law6Step(_flare_states, now, _current_altitude - terrain_alt, runway_profile);
+			height_rate_setpoint = -out.sink_setpoint;
+			pitch_direct = out.pitch;
+			pitch_min_rad = out.pitch_min;
+			pitch_max_rad = out.pitch_max;
+			throttle_direct = out.throttle;
+			airspeed_land = out.airspeed_setpoint;
+
+			if (PX4_ISFINITE(_vs_est)) {
+				_ctrl_configuration_handler.setEquivalentAirspeedMin(1.05f * _vs_est);
+			}
+
+		} else if (flare_law == 5) {
+			// airliner style: pitch holds the sink rate, throttle holds the airspeed (slowly), retard near the ground.
+			// Unlike law 3 / ArduPlane the throttle is not cut at flare start, so the touchdown airspeed and sink rate do
+			// not depend on how long the flare lasts. Unlike law 4 the pitch is not fixed: the thrust line above the CG
+			// pitches the aircraft with throttle, and the sink rate loop on pitch takes that out.
+			const float dt = math::constrain(hrt_elapsed_time(&_flare_states.last_update) * 1e-6f, 0.001f, 0.1f);
+			_flare_states.last_update = now;
+			const float transition = math::constrain(seconds_since_flare_start / math::max(_param_fw_lnd_fl_tatt.get(), 0.1f),
+						 0.0f, 1.0f);
+			const float height = _current_altitude - terrain_alt;
+			const float hold_height = _param_fw_lnd_fl_hold.get();
+			const float sink_hold = math::max(_param_fw_lnd_fl_sink.get(), 0.0f);
+			const float sink_upper = math::max(_param_fw_lnd_fl_snk1.get(), sink_hold);
+			const float sink_target = (height > hold_height) ? sink_upper : sink_hold;
+			const float sink_start = -_flare_states.initial_height_rate_setpoint;
+			const float sink_setpoint = transition * sink_target + (1.0f - transition) * sink_start;
+			height_rate_setpoint = -sink_setpoint;
+
+			// pitch: PI on the sink rate error around the pitch at flare start (as law 3)
+			const float sink_error = _local_pos.vz - sink_setpoint; // > 0: sinking faster than wanted
+			const float pitch_lo = radians(_param_fw_p_lim_min.get());
+			const float pitch_hi = radians(_param_fw_lnd_fl_pmax.get());
+			const float pitch_unsat = _flare_states.start_pitch + radians(_param_fw_lnd_fl_kp.get()) * sink_error
+						  + _flare_states.sink_rate_integral;
+
+			pitch_direct = math::constrain(pitch_unsat, pitch_lo, pitch_hi);
+
+			// law 6: the pitch command moves at most FW_LND_FL_PRT deg/s (user: no sudden nose up)
+			bool pitch_rate_up_held = false;
+			bool pitch_rate_down_held = false;
+
+			if (flare_law == 6 && _param_fw_lnd_fl_prt.get() > FLT_EPSILON) {
+				const float step = radians(_param_fw_lnd_fl_prt.get()) * dt;
+				const float limited = _flare_states.pitch_cmd + math::constrain(pitch_direct - _flare_states.pitch_cmd, -step, step);
+				pitch_rate_up_held = pitch_direct > limited + 1e-5f;
+				pitch_rate_down_held = pitch_direct < limited - 1e-5f;
+				pitch_direct = limited;
+			}
+
+			_flare_states.pitch_cmd = pitch_direct;
+
+			if (!(((pitch_unsat >= pitch_hi || pitch_rate_up_held) && sink_error > 0.0f)
+			      || ((pitch_unsat <= pitch_lo || pitch_rate_down_held) && sink_error < 0.0f))) {
+				_flare_states.sink_rate_integral += radians(_param_fw_lnd_fl_ki.get()) * sink_error * dt;
+			}
+
+			pitch_min_rad = pitch_lo;
+			pitch_max_rad = pitch_hi;
+
+			// throttle: PI on the airspeed error to FW_LND_FL_VATT (weight scaled), slew limited; idle below the hold height
+			float weight_ratio = 1.0f;
+
+			if (_param_weight_base.get() > FLT_EPSILON && _param_weight_gross.get() > FLT_EPSILON) {
+				weight_ratio = _param_weight_gross.get() / _param_weight_base.get();
+			}
+
+			float speed_target = _param_fw_lnd_fl_vatt.get() * sqrtf(weight_ratio);
+			float throttle_centre = _param_fw_lnd_fl_tff.get();
+
+			if (flare_law == 6) {
+				// airspeed falling linearly with height from the flare start airspeed to FW_LND_VTD_K x the stall speed at
+				// the hold-off height; without an estimate fall back to law 5's weight scaled FW_LND_FL_VATT
+				throttle_centre = _flare_states.throttle_start;
+
+				if (PX4_ISFINITE(_vs_est)) {
+					const float speed_td = _param_fw_lnd_vtd_k.get() * _vs_est;
+					const float speed_start = math::max(_flare_states.start_airspeed, speed_td);
+					const float span = math::max(_flare_states.start_height - hold_height, 0.1f);
+					const float fraction = math::constrain((height - hold_height) / span, 0.0f, 1.0f);
+					speed_target = speed_td + (speed_start - speed_td) * fraction;
+					_ctrl_configuration_handler.setEquivalentAirspeedMin(1.05f * _vs_est);
+				}
+
+				airspeed_land = speed_target;
+			}
+
+			const bool airspeed_ok = hrt_elapsed_time(&_time_airspeed_sample) < 1_s;
+			const float speed_error = airspeed_ok ? (speed_target - _airspeed_eas) : 0.0f; // > 0: too slow
+			const float thr_min = _param_fw_thr_idle.get();
+			const float thr_max = _param_fw_thr_max.get();
+			// law 6 keeps holding the touchdown airspeed until touchdown: a retard at the hold-off height (law 5) let the
+			// airspeed fall below the stall speed while the pitch loop raised the nose to 10 deg (1200 kg, 2026-11-10)
+			// The fixed wing land detector only triggers at low ground speed, so law 6 latches the touchdown itself: a
+			// downward range finder reading under 1.2 m (0.9 m rolling on the runway) and the sink rate under 0.35 m/s
+			// for 0.5 s. On the ground the EKF sink rate reads 0.2 m/s (2026-11-10), in the air below the hold-off height
+			// it is held at FW_LND_FL_SINK. Without a range finder: below the hold-off height.
+			if (flare_law == 6 && !_flare_states.touchdown) {
+				const bool near_ground = _local_pos.dist_bottom_valid ? (_local_pos.dist_bottom < 1.2f) : (height < hold_height);
+				_flare_states.touchdown_timer = (near_ground && _local_pos.vz < 0.35f) ? _flare_states.touchdown_timer + dt : 0.0f;
+				_flare_states.touchdown = _flare_states.touchdown_timer > 0.5f;
+			}
+
+			const bool touched_down = _landed || (flare_law == 6 && _flare_states.touchdown);
+			const bool retard = (flare_law == 6) ? touched_down : (height < hold_height || _landed);
+			const float thr_unsat = throttle_centre + _param_fw_lnd_fl_tkp.get() * speed_error
+						+ _flare_states.throttle_integral;
+			const float thr_target = retard ? thr_min : math::constrain(thr_unsat, thr_min, thr_max);
+			// on the ground (law 6) the throttle is cut three times faster than in the air
+			const float slew = (flare_law == 6 && touched_down) ? 3.0f * _param_fw_lnd_fl_tslw.get() : _param_fw_lnd_fl_tslw.get();
+			const float thr_prev = _flare_states.throttle_cmd;
+			_flare_states.throttle_cmd = (slew > FLT_EPSILON)
+						     ? thr_prev + math::constrain(thr_target - thr_prev, -slew * dt, slew * dt) : thr_target;
+			const bool slew_limited = fabsf(_flare_states.throttle_cmd - thr_target) > 1e-4f;
+			const bool held_up = thr_unsat >= thr_max || (slew_limited && thr_target > _flare_states.throttle_cmd);
+			const bool held_down = thr_unsat <= thr_min || (slew_limited && thr_target < _flare_states.throttle_cmd);
+
+			if (!retard && !((held_up && speed_error > 0.0f) || (held_down && speed_error < 0.0f))) {
+				_flare_states.throttle_integral += _param_fw_lnd_fl_tki.get() * speed_error * dt;
+			}
+
+			throttle_direct = (_landed && flare_law != 6) ? thr_min : _flare_states.throttle_cmd;
+
+			if (touched_down) {
+				pitch_direct = radians(_param_rwto_psp.get());
+				pitch_min_rad = math::min(pitch_min_rad, pitch_direct);
+			}
+
+		} else if (flare_law == 4) {
+			// power-on attitude landing: pitch held at the landing attitude, throttle holds the sink rate
+			// (FAA-H-8083-23 ch. 6 glassy water landing). Angle of attack fixed and lift = weight, so the touchdown
+			// airspeed depends on the attitude and the weight only, not on the pattern or the flare height.
+			const float dt = math::constrain(hrt_elapsed_time(&_flare_states.last_update) * 1e-6f, 0.001f, 0.1f);
+			_flare_states.last_update = now;
+			const float transition = math::constrain(seconds_since_flare_start / math::max(_param_fw_lnd_fl_tatt.get(), 0.1f),
+						 0.0f, 1.0f);
+			const float height = _current_altitude - terrain_alt;
+			const float sink_hold = math::max(_param_fw_lnd_fl_sink.get(), 0.0f);
+			const float sink_upper = math::max(_param_fw_lnd_fl_snk1.get(), sink_hold);
+			const float sink_target = (height > _param_fw_lnd_fl_hold.get()) ? sink_upper : sink_hold;
+			const float sink_start = -_flare_states.initial_height_rate_setpoint;
+			const float sink_setpoint = transition * sink_target + (1.0f - transition) * sink_start;
+			height_rate_setpoint = -sink_setpoint;
+
+			// weight scaling: airspeeds with sqrt(W / W_base), throttle (thrust ~ throttle^2, thrust ~ W) with W^(1/4)
+			float weight_ratio = 1.0f;
+
+			if (_param_weight_base.get() > FLT_EPSILON && _param_weight_gross.get() > FLT_EPSILON) {
+				weight_ratio = _param_weight_gross.get() / _param_weight_base.get();
+			}
+
+			const float speed_scale = sqrtf(weight_ratio);
+
+			// airspeed guard: lower the attitude (more speed, less lift) while below the weight scaled minimum
+			const float vmin = _param_fw_lnd_fl_vmin.get() * speed_scale;
+
+			const bool airspeed_ok = hrt_elapsed_time(&_time_airspeed_sample) < 1_s;
+
+			if (vmin > FLT_EPSILON && airspeed_ok && _airspeed_eas < vmin) {
+				_flare_states.attitude_offset = math::max(_flare_states.attitude_offset - radians(1.0f) * dt, radians(-2.0f));
+
+			} else {
+				_flare_states.attitude_offset = math::min(_flare_states.attitude_offset + radians(0.5f) * dt, 0.0f);
+			}
+
+			const float attitude = radians(_param_fw_lnd_fl_att.get()) + _flare_states.attitude_offset;
+			const float sink_error = _local_pos.vz - sink_setpoint; // > 0: sinking faster than wanted
+			const float thr_min = _param_fw_thr_idle.get();
+			const float thr_max = _param_fw_thr_max.get();
+
+			if (!_flare_states.attitude_hold) {
+				// 1) deceleration (FAA: slow to about Vs + 10 kt before setting the landing attitude): idle throttle,
+				// pitch holds the sink rate (PI as law 3), so raising the nose cannot make the aircraft climb. As the
+				// airspeed decays the pitch needed rises; at the landing attitude the airspeed is the equilibrium one.
+				const float pitch_lo = radians(_param_fw_p_lim_min.get());
+				const float pitch_unsat = _flare_states.start_pitch + radians(_param_fw_lnd_fl_kp.get()) * sink_error
+							  + _flare_states.sink_rate_integral;
+
+				if (!((pitch_unsat >= attitude && sink_error > 0.0f) || (pitch_unsat <= pitch_lo && sink_error < 0.0f))) {
+					_flare_states.sink_rate_integral += radians(_param_fw_lnd_fl_ki.get()) * sink_error * dt;
+				}
+
+				pitch_direct = math::constrain(pitch_unsat, pitch_lo, attitude);
+				throttle_direct = thr_min;
+				_flare_states.throttle_cmd = thr_min;
+
+				// the attitude hold airspeed is reached (or, without it, the attitude), or the hold height comes first:
+				// hand the sink rate to the throttle. The pitch criterion alone switched too slow: sinking faster than the
+				// setpoint, the angle of attack is higher and the airspeed lower at the same pitch (1200 kg stalled).
+				const float vatt = _param_fw_lnd_fl_vatt.get() * speed_scale;
+				const bool slow_enough = (vatt > FLT_EPSILON) ? (airspeed_ok && _airspeed_eas <= vatt) : (pitch_unsat >= attitude);
+
+				if (slow_enough || height < _param_fw_lnd_fl_hold.get()) {
+					_flare_states.attitude_hold = true;
+					_flare_states.throttle_integral = 0.0f;
+					_flare_states.hold_pitch = pitch_direct;
+					// the attitude hold starts at the feedforward throttle (user: 20 %), then moves at the slew rate
+					_flare_states.throttle_cmd = math::constrain(_param_fw_lnd_fl_tff.get(), thr_min, thr_max);
+				}
+
+				pitch_min_rad = pitch_lo;
+				pitch_max_rad = attitude + radians(3.0f);
+
+			} else {
+				// 2) attitude hold: pitch to the landing attitude at 3 deg/s, then fixed; throttle PI on the sink rate error
+				const float step = radians(3.0f) * dt;
+				_flare_states.hold_pitch += math::constrain(attitude - _flare_states.hold_pitch, -step, step);
+				pitch_direct = _flare_states.hold_pitch;
+				pitch_min_rad = math::min(pitch_direct, attitude) - radians(3.0f);
+				pitch_max_rad = math::max(pitch_direct, attitude) + radians(3.0f);
+				const float thr_unsat = _param_fw_lnd_fl_tff.get() + _param_fw_lnd_fl_tkp.get() * sink_error
+							+ _flare_states.throttle_integral;
+
+				const float thr_target = math::constrain(thr_unsat, thr_min, thr_max);
+				const float slew = _param_fw_lnd_fl_tslw.get();
+				const float thr_prev = _flare_states.throttle_cmd;
+				_flare_states.throttle_cmd = (slew > FLT_EPSILON)
+							     ? thr_prev + math::constrain(thr_target - thr_prev, -slew * dt, slew * dt) : thr_target;
+				const bool slew_limited = fabsf(_flare_states.throttle_cmd - thr_target) > 1e-4f;
+
+				// anti-windup: no integration while the output is held at a limit or by the slew rate in the error's direction
+				const bool held_up = (thr_unsat >= thr_max || (slew_limited && thr_target > _flare_states.throttle_cmd));
+				const bool held_down = (thr_unsat <= thr_min || (slew_limited && thr_target < _flare_states.throttle_cmd));
+
+				if (!((held_up && sink_error > 0.0f) || (held_down && sink_error < 0.0f))) {
+					_flare_states.throttle_integral += _param_fw_lnd_fl_tki.get() * sink_error * dt;
+				}
+
+				throttle_direct = _flare_states.throttle_cmd;
+			}
+
+			// after touchdown: idle, nose to the runway pitch (as the touchdown clamp of the other laws)
+			if (_landed) {
+				pitch_direct = radians(_param_rwto_psp.get());
+				pitch_min_rad = math::min(pitch_min_rad, pitch_direct);
+				throttle_direct = thr_min;
+			}
+
+		} else if (flare_law == 3) {
+			// autoland style flare: the sink rate error drives the pitch setpoint directly (PI around the pitch angle at
+			// flare start), bypassing the TECS energy balance, so airspeed decay and weight do not change the pitch response.
+			// Throttle stays with TECS under the idle ramp above (retard).
+			const float sink_rate_error = height_rate_setpoint + _local_pos.vz; // > 0: sinking faster than wanted
+			const float pitch_unsaturated = _flare_states.start_pitch + radians(_param_fw_lnd_fl_kp.get()) * sink_rate_error
+							+ _flare_states.sink_rate_integral;
+
+			// integrate only while the command is not held at a limit in the direction of the error (anti-windup)
+			if (!((pitch_unsaturated >= pitch_max_rad && sink_rate_error > 0.0f)
+			      || (pitch_unsaturated <= pitch_min_rad && sink_rate_error < 0.0f))) {
+				_flare_states.sink_rate_integral += radians(_param_fw_lnd_fl_ki.get()) * sink_rate_error * control_interval;
+			}
+
+			pitch_direct = math::constrain(pitch_unsaturated, pitch_min_rad, pitch_max_rad);
+		}
 
 		const fixed_wing_longitudinal_setpoint_s fw_longitudinal_control_sp = {
 			.timestamp = now,
 			.altitude = altitude_setpoint,
 			.height_rate = height_rate_setpoint,
 			.equivalent_airspeed = airspeed_land,
-			.pitch_direct = NAN,
-			.throttle_direct = NAN
+			.pitch_direct = pitch_direct,
+			.throttle_direct = throttle_direct
 		};
 
 		_longitudinal_ctrl_sp_pub.publish(fw_longitudinal_control_sp);
 
 		_ctrl_configuration_handler.setPitchMin(pitch_min_rad);
 		_ctrl_configuration_handler.setPitchMax(pitch_max_rad);
-		_ctrl_configuration_handler.setThrottleMax(throttle_max);
+		// law 4 keeps power on until touchdown (the throttle command itself goes to idle when landed)
+		_ctrl_configuration_handler.setThrottleMax((flare_law >= 4) ? _param_fw_thr_max.get() : throttle_max);
 		_ctrl_configuration_handler.setThrottleMin(_param_fw_thr_idle.get());
 		_ctrl_configuration_handler.setDisableUnderspeedProtection(true);
 
@@ -2149,6 +2540,13 @@ FixedWingModeManager::Run()
 			reset_landing_state();
 		}
 
+		// a water scoop only runs in AUTO (mission); leaving it (mode change by the operator) ends it
+		if (_control_mode_current != FW_POSCTRL_MODE_AUTO && _scoop.phase != ScoopPhase::OFF) {
+			mavlink_log_info(&_mavlink_log_pub, "SU: IPTAL MOD\t");
+			_scoop.phase = ScoopPhase::OFF;
+			_scoop.armed = false;
+		}
+
 		if (_control_mode_current != FW_POSCTRL_MODE_AUTO_TAKEOFF
 		    && _control_mode_current != FW_POSCTRL_MODE_AUTO_TAKEOFF_NO_NAV) {
 			reset_takeoff_state();
@@ -2159,8 +2557,15 @@ FixedWingModeManager::Run()
 
 		switch (_control_mode_current) {
 		case FW_POSCTRL_MODE_AUTO: {
-				control_auto(control_interval, curr_pos, ground_speed, _pos_sp_triplet.previous, _pos_sp_triplet.current,
-					     _pos_sp_triplet.next);
+				// GASI water scoop: the water waypoints (and the climb out of them) are flown by control_auto_scoop
+				if (scoopEngage(_pos_sp_triplet.previous, _pos_sp_triplet.current)) {
+					control_auto_scoop(now, control_interval, ground_speed, _pos_sp_triplet.current);
+
+				} else {
+					control_auto(control_interval, curr_pos, ground_speed, _pos_sp_triplet.previous, _pos_sp_triplet.current,
+						     _pos_sp_triplet.next);
+				}
+
 				break;
 			}
 
@@ -2226,6 +2631,7 @@ FixedWingModeManager::Run()
 		}
 
 		if (_control_mode_current != FW_POSCTRL_MODE_OTHER) {
+			apply_takeoff_exit_blend(now);
 			_ctrl_configuration_handler.update(now);
 		}
 
@@ -2276,6 +2682,51 @@ FixedWingModeManager::reset_takeoff_state()
 	_launch_detected = false;
 
 	_takeoff_ground_alt = _current_altitude;
+
+	// _time_takeoff_climbout_last is kept: this runs every cycle outside the takeoff modes, where the exit blend runs.
+	// apply_takeoff_exit_blend() clears it when the blend ends or the vehicle disarms.
+}
+
+void
+FixedWingModeManager::apply_takeoff_exit_blend(const hrt_abstime now)
+{
+	const float blend_time = _param_fw_tko_blend_t.get();
+
+	if (blend_time < FLT_EPSILON || _time_takeoff_climbout_last == 0 || now <= _time_takeoff_climbout_last) {
+		// disabled, no runway climbout yet, or still in it
+		return;
+	}
+
+	const float progress = (now - _time_takeoff_climbout_last) * 1e-6f / blend_time;
+
+	if (progress >= 1.f || _landed || !_control_mode.flag_armed
+	    || _control_mode_current == FW_POSCTRL_MODE_AUTO_LANDING_STRAIGHT
+	    || _control_mode_current == FW_POSCTRL_MODE_AUTO_LANDING_CIRCULAR
+	    || _control_mode_current == FW_POSCTRL_MODE_MANUAL_POSITION
+	    || _control_mode_current == FW_POSCTRL_MODE_MANUAL_ALTITUDE
+	    || _control_mode_current == FW_POSCTRL_MODE_OTHER) {
+		_time_takeoff_climbout_last = 0;
+		return;
+	}
+
+	// pitch floor: from the climbout floor down to FW_P_LIM_MIN
+	const float pitch_min_blend = math::interpolate(progress, 0.f, 1.f, _takeoff_exit_pitch_min,
+				      math::radians(_param_fw_p_lim_min.get()));
+	const float pitch_min = _ctrl_configuration_handler.getPitchMin();
+	_ctrl_configuration_handler.setPitchMin(PX4_ISFINITE(pitch_min) ? math::max(pitch_min, pitch_min_blend) : pitch_min_blend);
+
+	// throttle range: opens from the takeoff throttle to FW_THR_MIN..FW_THR_MAX
+	const float throttle_min_blend = math::interpolate(progress, 0.f, 1.f, _takeoff_exit_throttle, _param_fw_thr_min.get());
+	const float throttle_max_blend = math::interpolate(progress, 0.f, 1.f, _takeoff_exit_throttle, _param_fw_thr_max.get());
+	const float throttle_min = _ctrl_configuration_handler.getThrottleMin();
+	const float throttle_max = _ctrl_configuration_handler.getThrottleMax();
+	const float throttle_max_new = PX4_ISFINITE(throttle_max) ? math::min(throttle_max, throttle_max_blend) : throttle_max_blend;
+	const float throttle_min_new = PX4_ISFINITE(throttle_min) ? math::max(throttle_min, throttle_min_blend) : throttle_min_blend;
+	_ctrl_configuration_handler.setThrottleMin(math::min(throttle_min_new, throttle_max_new));
+	_ctrl_configuration_handler.setThrottleMax(throttle_max_new);
+
+	// flaps: retract from the takeoff setting instead of at once
+	_flaps_setpoint = math::max(_flaps_setpoint, (1.f - progress) * _param_fw_flaps_to_scl.get());
 }
 
 void
@@ -2415,6 +2866,59 @@ FixedWingModeManager::calculateLandingApproachVector() const
 
 	return landing_approach_vector;
 }
+
+float
+FixedWingModeManager::updateStallSpeedEstimate(const hrt_abstime now, const float height)
+{
+	// frozen while flaring: ground effect and the flare manoeuvre would bias it
+	if (_flare_states.flaring) {
+		return (_vs_est_settled >= _param_fw_lnd_vs_tau.get()) ? _vs_est : NAN;
+	}
+
+	// a new landing approach (not called for a while): start over
+	if (hrt_elapsed_time(&_vs_est_last_call) > 3_s) {
+		_vs_est = NAN;
+		_vs_est_settled = 0.0f;
+		_vs_est_last_sample = 0;
+		_vs_wings_level_since = 0;
+	}
+
+	_vs_est_last_call = now;
+
+	const bool airspeed_ok = hrt_elapsed_time(&_time_airspeed_sample) < 1_s;
+
+	// samples only after 2 s wings level (the turn onto final biased the first samples high), clear of ground effect
+	if (fabsf(_roll) > radians(_param_fw_lnd_vs_roll.get()) || _vs_wings_level_since == 0) {
+		_vs_wings_level_since = now;
+	}
+
+	if (airspeed_ok && _airspeed_eas > 10.0f && height > _param_fw_lnd_vs_hmin.get()
+	    && hrt_elapsed_time(&_vs_wings_level_since) > (hrt_abstime)(_param_fw_lnd_vs_lvl.get() * 1e6f)
+	    && _param_fw_lnd_vs_clmx.get() > FLT_EPSILON) {
+		// synthetic angle of attack: pitch minus the flight path angle (still air, no vertical wind)
+		const float flight_path_angle = asinf(math::constrain(-_local_pos.vz / _airspeed_eas, -0.5f, 0.5f));
+		const float alpha = _pitch - flight_path_angle;
+		const float cl = math::constrain(_param_fw_lnd_vs_cl0.get() + _param_fw_lnd_vs_cla.get() * alpha, 0.1f,
+						 _param_fw_lnd_vs_clmx.get());
+		// lift = weight cos(roll): 1 g stall speed V sqrt(CL cos(roll) / CLmax)
+		const float vs_sample = _airspeed_eas * sqrtf(cl * cosf(_roll) / _param_fw_lnd_vs_clmx.get());
+		const float dt = (_vs_est_last_sample > 0) ? math::constrain(hrt_elapsed_time(&_vs_est_last_sample) * 1e-6f, 0.0f,
+				 0.5f) : 0.0f;
+		_vs_est_last_sample = now;
+
+		if (!PX4_ISFINITE(_vs_est)) {
+			_vs_est = vs_sample;
+
+		} else {
+			// first order filter, FW_LND_VS_TAU time constant
+			_vs_est += (vs_sample - _vs_est) * math::min(dt / math::max(_param_fw_lnd_vs_tau.get(), 0.1f), 1.0f);
+			_vs_est_settled += dt;
+		}
+	}
+
+	return (_vs_est_settled >= _param_fw_lnd_vs_tau.get()) ? _vs_est : NAN;
+}
+
 
 float
 FixedWingModeManager::getLandingTerrainAltitudeEstimate(const hrt_abstime &now, const float land_point_altitude,
@@ -2742,4 +3246,601 @@ lateral-longitudinal controller and and controllers below that (attitude, rate).
 extern "C" __EXPORT int fw_mode_manager_main(int argc, char *argv[])
 {
 	return FixedWingModeManager::main(argc, argv);
+}
+
+
+void
+FixedWingModeManager::law6Start(FlareStates &fs, const hrt_abstime now, const float height)
+{
+	fs = FlareStates{};
+	fs.flaring = true;
+	fs.start_time = now;
+	fs.initial_height_rate_setpoint = -_local_pos.vz;
+	fs.start_height = height;
+	fs.start_pitch = _pitch;
+	fs.pitch_cmd = _pitch;
+	vehicle_thrust_setpoint_s thrust_sp{};
+	fs.throttle_start = (_vehicle_thrust_setpoint_sub.copy(&thrust_sp) && PX4_ISFINITE(thrust_sp.xyz[0]))
+			    ? math::constrain(thrust_sp.xyz[0], _param_fw_thr_idle.get(), _param_fw_thr_max.get())
+			    : _param_fw_lnd_fl_tff.get();
+	fs.throttle_cmd = fs.throttle_start;
+	fs.start_airspeed = _airspeed_eas;
+	fs.last_update = now;
+}
+
+FixedWingModeManager::Law6Output
+FixedWingModeManager::law6Step(FlareStates &fs, const hrt_abstime now, const float height, const Law6Profile &profile)
+{
+	// Flare law 6: pitch holds the sink rate (PI around the pitch at flare start, at most FW_LND_FL_PRT deg/s), the
+	// throttle holds an airspeed falling with height to vtd_k x the estimated stall speed (PI around the flare start
+	// throttle, at most FW_LND_FL_TSLW per s). Touchdown latched from the range finder and the sink rate. Runway: retard
+	// (3 x slew) and runway pitch after touchdown. Water: the caller takes over at touchdown (scoop).
+	Law6Output out{};
+	const float dt = math::constrain(hrt_elapsed_time(&fs.last_update) * 1e-6f, 0.001f, 0.1f);
+	fs.last_update = now;
+	const float seconds_since_flare_start = hrt_elapsed_time(&fs.start_time) * 1e-6f;
+	const float transition = math::constrain(seconds_since_flare_start / math::max(_param_fw_lnd_fl_tatt.get(), 0.1f),
+				 0.0f, 1.0f);
+	const float hold_height = _param_fw_lnd_fl_hold.get();
+	const float sink_hold = math::max(_param_fw_lnd_fl_sink.get(), 0.0f);
+	const float sink_upper = math::max(_param_fw_lnd_fl_snk1.get(), sink_hold);
+	const float sink_target = (height > hold_height) ? sink_upper : sink_hold;
+	const float sink_start = -fs.initial_height_rate_setpoint;
+	const float sink_setpoint = transition * sink_target + (1.0f - transition) * sink_start;
+	out.sink_setpoint = sink_setpoint;
+
+	// pitch
+	const float sink_error = _local_pos.vz - sink_setpoint; // > 0: sinking faster than wanted
+	const float pitch_lo = radians(_param_fw_p_lim_min.get());
+	const float pitch_hi = profile.pitch_max_rad;
+	const float pitch_unsat = fs.start_pitch + radians(_param_fw_lnd_fl_kp.get()) * sink_error + fs.sink_rate_integral;
+	float pitch = math::constrain(pitch_unsat, pitch_lo, pitch_hi);
+	bool pitch_rate_up_held = false;
+	bool pitch_rate_down_held = false;
+
+	if (_param_fw_lnd_fl_prt.get() > FLT_EPSILON) {
+		const float step = radians(_param_fw_lnd_fl_prt.get()) * dt;
+		const float limited = fs.pitch_cmd + math::constrain(pitch - fs.pitch_cmd, -step, step);
+		pitch_rate_up_held = pitch > limited + 1e-5f;
+		pitch_rate_down_held = pitch < limited - 1e-5f;
+		pitch = limited;
+	}
+
+	fs.pitch_cmd = pitch;
+
+	if (!(((pitch_unsat >= pitch_hi || pitch_rate_up_held) && sink_error > 0.0f)
+	      || ((pitch_unsat <= pitch_lo || pitch_rate_down_held) && sink_error < 0.0f))) {
+		fs.sink_rate_integral += radians(_param_fw_lnd_fl_ki.get()) * sink_error * dt;
+	}
+
+	out.pitch_min = pitch_lo;
+	out.pitch_max = pitch_hi;
+
+	// airspeed target
+	float speed_target;
+
+	if (PX4_ISFINITE(_vs_est)) {
+		const float speed_td = profile.vtd_k * _vs_est;
+		const float speed_start = math::max(fs.start_airspeed, speed_td);
+		const float span = math::max(fs.start_height - hold_height, 0.1f);
+		const float fraction = math::constrain((height - hold_height) / span, 0.0f, 1.0f);
+		speed_target = speed_td + (speed_start - speed_td) * fraction;
+
+	} else {
+		float weight_ratio = 1.0f;
+
+		if (_param_weight_base.get() > FLT_EPSILON && _param_weight_gross.get() > FLT_EPSILON) {
+			weight_ratio = _param_weight_gross.get() / _param_weight_base.get();
+		}
+
+		speed_target = _param_fw_lnd_fl_vatt.get() * sqrtf(weight_ratio);
+	}
+
+	out.airspeed_setpoint = speed_target;
+
+	// touchdown latch: range finder under 1.2 m and sink rate under 0.35 m/s for 0.5 s (the land detector needs a low
+	// ground speed); without a range finder below the hold-off height
+	if (!fs.touchdown) {
+		const bool near_ground = _local_pos.dist_bottom_valid ? (_local_pos.dist_bottom < _param_fw_lnd_td_rng.get()) :
+					 (height < hold_height);
+		fs.touchdown_timer = (near_ground && _local_pos.vz < _param_fw_lnd_td_vz.get()) ? fs.touchdown_timer + dt : 0.0f;
+		fs.touchdown = fs.touchdown_timer > _param_fw_lnd_td_t.get();
+
+		// water: the hull sinks ~0.3 m and the radar (under the hull) goes under the water line. It then loses the
+		// surface (invalid, below its minimum) or sees the sea bed (a jump of metres). Near the surface either one means
+		// water contact (2026-11-11, first PX4 scoop: 0.53 m -> invalid -> 6.2 m sea bed)
+		if (profile.water && PX4_ISFINITE(fs.last_range) && fs.last_range < _param_fw_lnd_td_rng.get() + 0.5f
+		    && (!_local_pos.dist_bottom_valid || _local_pos.dist_bottom > fs.last_range + 1.5f)) {
+			fs.touchdown = true;
+		}
+	}
+
+	if (_local_pos.dist_bottom_valid && (!PX4_ISFINITE(fs.last_range) || _local_pos.dist_bottom < fs.last_range + 1.5f)) {
+		fs.last_range = _local_pos.dist_bottom;
+	}
+
+	out.touched_down = _landed || fs.touchdown;
+
+	// throttle
+	const bool airspeed_ok = hrt_elapsed_time(&_time_airspeed_sample) < 1_s;
+	const float speed_error = airspeed_ok ? (speed_target - _airspeed_eas) : 0.0f; // > 0: too slow
+	const float thr_min = _param_fw_thr_idle.get();
+	const float thr_max = _param_fw_thr_max.get();
+	const bool retard = out.touched_down && !profile.water;
+	const float thr_unsat = fs.throttle_start + _param_fw_lnd_fl_tkp.get() * speed_error + fs.throttle_integral;
+	const float thr_target = retard ? thr_min : math::constrain(thr_unsat, thr_min, thr_max);
+	const float slew = out.touched_down ? 3.0f * _param_fw_lnd_fl_tslw.get() : _param_fw_lnd_fl_tslw.get();
+	const float thr_prev = fs.throttle_cmd;
+	fs.throttle_cmd = (slew > FLT_EPSILON) ? thr_prev + math::constrain(thr_target - thr_prev, -slew * dt, slew * dt) : thr_target;
+	const bool slew_limited = fabsf(fs.throttle_cmd - thr_target) > 1e-4f;
+	const bool held_up = thr_unsat >= thr_max || (slew_limited && thr_target > fs.throttle_cmd);
+	const bool held_down = thr_unsat <= thr_min || (slew_limited && thr_target < fs.throttle_cmd);
+
+	if (!retard && !((held_up && speed_error > 0.0f) || (held_down && speed_error < 0.0f))) {
+		fs.throttle_integral += _param_fw_lnd_fl_tki.get() * speed_error * dt;
+	}
+
+	out.throttle = fs.throttle_cmd;
+
+	if (out.touched_down && !profile.water) {
+		out.pitch = radians(_param_rwto_psp.get());
+		out.pitch_min = math::min(out.pitch_min, out.pitch);
+
+	} else {
+		out.pitch = pitch;
+	}
+
+	return out;
+}
+
+const char *
+FixedWingModeManager::scoopPhaseName(ScoopPhase phase)
+{
+	switch (phase) {
+	case ScoopPhase::APPROACH: return "YAKLASMA";
+
+	case ScoopPhase::GATE_PASSED: return "KAPI_GECTI";
+
+	case ScoopPhase::FLARE: return "FLARE";
+
+	case ScoopPhase::TOUCHDOWN: return "DEGME";
+
+	case ScoopPhase::SCOOP: return "SUALMA";
+
+	case ScoopPhase::TAKEOFF: return "KALKIS";
+
+	case ScoopPhase::DONE: return "BITTI";
+
+	case ScoopPhase::ABORT: return "IPTAL";
+
+	default: return "KAPALI";
+	}
+}
+
+void
+FixedWingModeManager::setScoopPhase(const hrt_abstime now, ScoopPhase phase, const char *detail)
+{
+	_scoop.phase = phase;
+	_scoop.phase_start = now;
+
+	if (detail) {
+		mavlink_log_info(&_mavlink_log_pub, "SU: %s %s\t", scoopPhaseName(phase), detail);
+
+	} else {
+		mavlink_log_info(&_mavlink_log_pub, "SU: %s\t", scoopPhaseName(phase));
+	}
+
+	debug_key_value_s dbg{};
+	strncpy(dbg.key, "SU_ASAMA", sizeof(dbg.key) - 1);
+	dbg.value = static_cast<float>(phase);
+	dbg.timestamp = now;
+	_debug_key_value_pub.publish(dbg);
+	_scoop.last_status = now;
+}
+
+void
+FixedWingModeManager::scoopAbort(const hrt_abstime now, const char *reason)
+{
+	if (_scoop.phase == ScoopPhase::ABORT) {
+		return;
+	}
+
+	setScoopPhase(now, ScoopPhase::ABORT, reason);
+	_scoop.loiter_sent = false;
+}
+
+bool
+FixedWingModeManager::scoopEngage(const position_setpoint_s &pos_sp_prev, const position_setpoint_s &pos_sp_curr)
+{
+	if (_scoop.phase != ScoopPhase::OFF) {
+		return true;
+	}
+
+	if (!_scoop.armed || !PX4_ISFINITE(_scoop.water_amsl) || !pos_sp_curr.valid || !pos_sp_prev.valid
+	    || pos_sp_curr.type != position_setpoint_s::SETPOINT_TYPE_POSITION
+	    || fabsf(pos_sp_curr.alt - _scoop.water_amsl) > 2.f) {
+		return false;
+	}
+
+	// the first water waypoint: freeze the approach line (previous waypoint -> touchdown point); the navigator may
+	// move on to the second water waypoint and beyond while the scoop is flown
+	_scoop.entrance = _global_local_proj_ref.project(pos_sp_prev.lat, pos_sp_prev.lon);
+	_scoop.touchdown = _global_local_proj_ref.project(pos_sp_curr.lat, pos_sp_curr.lon);
+	_scoop.entrance_alt = pos_sp_prev.alt;
+	_scoop.last_update = hrt_absolute_time();
+	setScoopPhase(_scoop.last_update, ScoopPhase::APPROACH);
+	return true;
+}
+
+void
+FixedWingModeManager::control_auto_scoop(const hrt_abstime &now, const float control_interval,
+		const Vector2f &ground_speed, const position_setpoint_s &pos_sp_curr)
+{
+	const float dt = math::constrain((now - _scoop.last_update) * 1e-6f, 0.001f, 0.1f);
+	_scoop.last_update = now;
+
+	if (now - _scoop.last_status > 500_ms) {
+		debug_key_value_s dbg{};
+		strncpy(dbg.key, "SU_ASAMA", sizeof(dbg.key) - 1);
+		dbg.value = static_cast<float>(_scoop.phase);
+		dbg.timestamp = now;
+		_debug_key_value_pub.publish(dbg);
+		_scoop.last_status = now;
+	}
+
+	const Vector2f local_position{_local_pos.x, _local_pos.y};
+	const Vector2f line = _scoop.touchdown - _scoop.entrance;
+	const Vector2f dir = line.unit_or_zero();
+	const Vector2f rel = local_position - _scoop.touchdown;
+	const float along_to_touchdown = -dir.dot(rel);            // > 0 before the touchdown point
+	const float cross = dir(0) * rel(1) - dir(1) * rel(0);     // > 0 right of the line
+	// height over the water: the radar, unless it disagrees with the altitude over the water surface (item param7) by
+	// more than 3 m once on the water (radar under the water line sees the sea bed) or is invalid
+	const float height_baro = _current_altitude - _scoop.water_amsl;
+	const bool radar = _local_pos.dist_bottom_valid
+			   && (!_scoop.on_water || fabsf(_local_pos.dist_bottom - height_baro) < 3.f);
+	const float height = radar ? _local_pos.dist_bottom : math::max(height_baro, 0.f);
+	const float line_course = atan2f(dir(1), dir(0));
+	const float ground_course = atan2f(ground_speed(1), ground_speed(0));
+	const float course_error = math::degrees(fabsf(wrap_pi(ground_course - line_course)));
+	const bool airspeed_ok = hrt_elapsed_time(&_time_airspeed_sample) < 1_s;
+
+	// lateral: always the scoop line (beyond the touchdown point it continues straight)
+	const DirectionalGuidanceOutput sp = navigateLine(_scoop.entrance, _scoop.touchdown, local_position, ground_speed,
+					     _wind_vel);
+	fixed_wing_lateral_setpoint_s fw_lateral_ctrl_sp{empty_lateral_control_setpoint};
+	fw_lateral_ctrl_sp.timestamp = now;
+	fw_lateral_ctrl_sp.course = sp.course_setpoint;
+	fw_lateral_ctrl_sp.lateral_acceleration = sp.lateral_acceleration_feedforward;
+	_lateral_ctrl_sp_pub.publish(fw_lateral_ctrl_sp);
+
+	if (_scoop.phase <= ScoopPhase::TAKEOFF) {
+		_ctrl_configuration_handler.setLateralAccelMax(rollAngleToLateralAccel(getMaxRollAngleNearGround(_current_altitude,
+				_scoop.water_amsl)));
+	}
+
+	fixed_wing_longitudinal_setpoint_s lon_sp{};
+	lon_sp.timestamp = now;
+	lon_sp.altitude = NAN;
+	lon_sp.height_rate = NAN;
+	lon_sp.equivalent_airspeed = NAN;
+	lon_sp.pitch_direct = NAN;
+	lon_sp.throttle_direct = NAN;
+
+	switch (_scoop.phase) {
+	case ScoopPhase::APPROACH:
+	case ScoopPhase::GATE_PASSED: {
+			// glide slope (FW_LND_ANG) to the touchdown point on the water, approach airspeed from the stall speed estimate
+			_flaps_setpoint = _param_fw_flaps_lnd_scl.get();
+			_ctrl_configuration_handler.setEnforceLowHeightCondition(true);
+			const float vs_est = updateStallSpeedEstimate(now, height);
+			float airspeed = _param_fw_lnd_airspd.get();
+
+			if (PX4_ISFINITE(vs_est)) {
+				airspeed = _param_fw_lnd_vapp_k.get() * vs_est;
+				_ctrl_configuration_handler.setEquivalentAirspeedMin(1.05f * vs_est);
+			}
+
+			const float glide = tanf(radians(_param_fw_lnd_ang.get()));
+			const float glide_alt = _scoop.water_amsl + math::min(math::max(along_to_touchdown, 0.f) * glide,
+						_scoop.entrance_alt - _scoop.water_amsl);
+			lon_sp.altitude = math::min(_current_altitude, glide_alt);
+			lon_sp.equivalent_airspeed = airspeed;
+			_ctrl_configuration_handler.setSinkRateTarget(math::max(airspeed * glide, _param_sinkrate_target.get()));
+			_ctrl_configuration_handler.setThrottleMin(_param_fw_thr_idle.get());
+
+			if (height < _param_fw_lnd_flalt.get()) {
+				// gate (as hizalanma.gate_ok): on the line, wings level, at the approach airspeed
+				char why[64] {};
+
+				if (fabsf(cross) > _param_fw_sc_g_xtrk.get()) {
+					snprintf(why, sizeof(why), "KAPI yan %.1f m", (double)cross);
+
+				} else if (course_error > _param_fw_sc_g_crs.get()) {
+					snprintf(why, sizeof(why), "KAPI yon %.1f deg", (double)course_error);
+
+				} else if (fabsf(math::degrees(_roll)) > _param_fw_sc_g_roll.get()) {
+					snprintf(why, sizeof(why), "KAPI yatis %.1f deg", (double)math::degrees(_roll));
+
+				} else if (airspeed_ok && fabsf(_airspeed_eas - airspeed) > _param_fw_sc_g_spd.get()) {
+					snprintf(why, sizeof(why), "KAPI hiz %.1f (hedef %.1f)", (double)_airspeed_eas, (double)airspeed);
+				}
+
+				if (why[0] != '\0') {
+					scoopAbort(now, why);
+
+				} else {
+					setScoopPhase(now, ScoopPhase::GATE_PASSED);
+					law6Start(_scoop.flare, now, height);
+					setScoopPhase(now, ScoopPhase::FLARE);
+				}
+			}
+
+			break;
+		}
+
+	case ScoopPhase::FLARE: {
+			_flaps_setpoint = _param_fw_flaps_lnd_scl.get();
+			const Law6Profile water_profile{_param_fw_sc_vtd_k.get(), radians(_param_fw_sc_pmax.get()), true};
+			const Law6Output out = law6Step(_scoop.flare, now, height, water_profile);
+			lon_sp.height_rate = -out.sink_setpoint;
+			lon_sp.pitch_direct = out.pitch;
+			lon_sp.throttle_direct = out.throttle;
+			lon_sp.equivalent_airspeed = out.airspeed_setpoint;
+			_ctrl_configuration_handler.setPitchMin(out.pitch_min);
+			_ctrl_configuration_handler.setPitchMax(out.pitch_max);
+
+			if (PX4_ISFINITE(_vs_est)) {
+				_ctrl_configuration_handler.setEquivalentAirspeedMin(1.05f * _vs_est);
+			}
+
+			// own go-around checks above 1 m (below it the touchdown comes first)
+			if (height > _param_fw_sc_a_hmin.get()) {
+				char why[64] {};
+
+				if (airspeed_ok && PX4_ISFINITE(_vs_est) && _airspeed_eas < _vs_est) {
+					snprintf(why, sizeof(why), "HIZ_DUSUK %.1f < %.1f", (double)_airspeed_eas, (double)_vs_est);
+
+				} else if (fabsf(math::degrees(_roll)) > _param_fw_sc_a_roll.get()) {
+					snprintf(why, sizeof(why), "YATIS %.1f deg", (double)math::degrees(_roll));
+
+				} else if (fabsf(cross) > _param_fw_sc_a_xtrk.get()) {
+					snprintf(why, sizeof(why), "YAN_SAPMA %.1f m", (double)cross);
+
+				} else if (!radar && height > _param_fw_lnd_td_rng.get() + 1.f && height < _param_fw_lnd_flalt.get()) {
+					snprintf(why, sizeof(why), "RADAR");
+				}
+
+				if (why[0] != '\0') {
+					scoopAbort(now, why);
+					break;
+				}
+			}
+
+			if (out.touched_down) {
+				_scoop.on_water = true;
+				char detail[96] {};
+				snprintf(detail, sizeof(detail), "v=%.1f p=%.1f vz=%.2f", (double)_airspeed_eas, (double)math::degrees(_pitch),
+					 (double)_local_pos.vz);
+				setScoopPhase(now, ScoopPhase::TOUCHDOWN, detail);
+				_scoop.pitch_cmd = _scoop.flare.pitch_cmd;
+				_scoop.throttle_cmd = _scoop.flare.throttle_cmd;
+				_scoop.throttle_integral = 0.f;
+				setScoopPhase(now, ScoopPhase::SCOOP);
+			}
+
+			break;
+		}
+
+	case ScoopPhase::TOUCHDOWN:
+	case ScoopPhase::SCOOP: {
+			// on the water with power: pitch to FW_SC_PITCH, throttle holds the scoop airspeed (PI around the touchdown
+			// throttle, 3 x FW_LND_FL_TSLW); the tank fills while the airspeed is in the band
+			_flaps_setpoint = _param_fw_flaps_lnd_scl.get();
+
+			// predicted airspeed (FW_SC_LOOK s ahead): the throttle opens while still decelerating towards the band
+			// (7b, 1200 kg: gaz ~0 until under 25 m/s, then the airspeed fell to 21 m/s)
+			if (airspeed_ok) {
+				const float accel = (_scoop.last_airspeed > 0.f) ? (_airspeed_eas - _scoop.last_airspeed) / dt : 0.f;
+				_scoop.accel_filt += (math::constrain(accel, -10.f, 10.f) - _scoop.accel_filt) * math::min(dt / 0.5f, 1.f);
+				_scoop.last_airspeed = _airspeed_eas;
+			}
+
+			const float predicted = _airspeed_eas + _scoop.accel_filt * _param_fw_sc_look.get();
+			const float speed_error = airspeed_ok ? (_scoop.target_speed - predicted) : 0.f;
+			const float thr_min = _param_fw_thr_idle.get();
+			const float thr_max = _param_fw_thr_max.get();
+
+			// feedforward (water_leg: sqrt(base^2 + scoop momentum drag / max thrust)), the base scaled with the weight
+			// from the stall speed estimate (FW_SC_THR_FF at FW_SC_FF_VS)
+			const float weight_scale = (PX4_ISFINITE(_vs_est) && _param_fw_sc_ff_vs.get() > FLT_EPSILON) ?
+						   math::sq(_vs_est / _param_fw_sc_ff_vs.get()) : 1.f;
+			const float filling = (_scoop.scoop_started && _scoop.scoop_time < _scoop.duration) ? 1.f : 0.f;
+			const float thr_ff = sqrtf(math::sq(_param_fw_sc_thr_ff.get()) * weight_scale
+						   + filling * _param_fw_sc_fill.get() * math::max(_airspeed_eas, 0.f) / math::max(_param_fw_sc_tmax.get(), 1.f));
+
+			// thrust line above the CG: more throttle pitches the nose down; pitch feedforward with the throttle
+			const float pitch_target = radians(_param_fw_sc_pitch.get() + _param_fw_sc_p_thr.get() * (_scoop.throttle_cmd - thr_ff));
+			const float step = radians(math::max(_param_fw_lnd_fl_prt.get(), 0.5f)) * dt;
+			_scoop.pitch_cmd += math::constrain(pitch_target - _scoop.pitch_cmd, -step, step);
+			const float thr_unsat = thr_ff + _param_fw_sc_tkp.get() * speed_error + _scoop.throttle_integral;
+			// low speed guard: predicted airspeed within FW_SC_V_MARG of the band floor -> full throttle (PX4's airspeed
+			// reads ~0.2 m/s under the simulator's, 7b round 5)
+			const bool low_guard = airspeed_ok && predicted < _scoop.speed_min + _param_fw_sc_v_marg.get();
+			const float thr_target = low_guard ? thr_max : math::constrain(thr_unsat, thr_min, thr_max);
+			const float slew = 3.f * _param_fw_lnd_fl_tslw.get() * dt;
+			const float prev = _scoop.throttle_cmd;
+			_scoop.throttle_cmd = prev + math::constrain(thr_target - prev, -slew, slew);
+			const bool slew_limited = fabsf(_scoop.throttle_cmd - thr_target) > 1e-4f;
+			const bool held_up = thr_unsat >= thr_max || (slew_limited && thr_target > _scoop.throttle_cmd);
+			const bool held_down = thr_unsat <= thr_min || (slew_limited && thr_target < _scoop.throttle_cmd);
+
+			if (!((held_up && speed_error > 0.f) || (held_down && speed_error < 0.f))) {
+				_scoop.throttle_integral += _param_fw_sc_tki.get() * speed_error * dt;
+			}
+
+			lon_sp.pitch_direct = _scoop.pitch_cmd;
+			lon_sp.throttle_direct = _scoop.throttle_cmd;
+			lon_sp.height_rate = 0.f;
+			lon_sp.equivalent_airspeed = _scoop.target_speed;
+			_ctrl_configuration_handler.setPitchMin(math::min(_scoop.pitch_cmd, radians(_param_fw_sc_pitch.get())) - radians(2.f));
+			_ctrl_configuration_handler.setPitchMax(math::max(_scoop.pitch_cmd, radians(_param_fw_sc_pitch.get())) + radians(2.f));
+			_ctrl_configuration_handler.setEquivalentAirspeedMin(10.f);
+
+			const bool in_band = airspeed_ok && _airspeed_eas >= _scoop.speed_min && _airspeed_eas <= _param_fw_sc_vmax.get();
+
+			// control band (item param4 .. FW_SC_VMAX): the throttle aims inside it, the tank fills in it.
+			// Abort band (FW_SC_A_VMIN .. FW_SC_A_VMAX, wider): only leaving it longer than FW_SC_OOB_T aborts (user)
+			if (in_band) {
+				_scoop.scoop_started = true;
+				_scoop.scoop_time += dt;
+
+			} else if (_scoop.scoop_started) {
+				_scoop.out_of_band += dt;
+			}
+
+			if (_scoop.scoop_started && airspeed_ok
+			    && (_airspeed_eas < _param_fw_sc_a_vmin.get() || _airspeed_eas > _param_fw_sc_a_vmax.get())) {
+				_scoop.out_of_abort_band += dt;
+			}
+
+			if (_scoop.scoop_started && airspeed_ok) {
+				_scoop.speed_lo = math::min(_scoop.speed_lo, _airspeed_eas);
+				_scoop.speed_hi = math::max(_scoop.speed_hi, _airspeed_eas);
+			}
+
+			const float in_phase = (now - _scoop.phase_start) * 1e-6f;
+
+			if (_scoop.scoop_time >= _scoop.duration) {
+				char detail[96] {};
+				snprintf(detail, sizeof(detail), "t=%.1f v=%.1f-%.1f d=%.1f a=%.1f k=%d", (double)_scoop.scoop_time,
+					 (double)_scoop.speed_lo, (double)_scoop.speed_hi, (double)_scoop.out_of_band, (double)_scoop.out_of_abort_band,
+					 _scoop.out_of_abort_band < 0.05f ? 1 : 0);
+				setScoopPhase(now, ScoopPhase::TAKEOFF, detail);
+
+			} else if (_scoop.out_of_abort_band > _param_fw_sc_oob_t.get() || in_phase > _scoop.duration + _param_fw_sc_t_marg.get()) {
+				char why[96] {};
+				snprintf(why, sizeof(why), "BANT t=%.1f v=%.1f-%.1f a=%.1f", (double)_scoop.scoop_time,
+					 (double)_scoop.speed_lo, (double)_scoop.speed_hi, (double)_scoop.out_of_abort_band);
+				scoopAbort(now, why);
+			}
+
+			break;
+		}
+
+	case ScoopPhase::TAKEOFF: {
+			// on the water: throttle up (0.5 /s), pitch to FW_SC_TO_PITCH with the same throttle feedforward as the scoop
+			// (thrust line above the CG). Off the water (radar/altitude over FW_SC_LIFT_H): TECS climb at the trim airspeed
+			// to FW_SC_DONE_H, so there is no handover step at the end (7b round 3: 64 m/s, then +15 deg at the handover).
+			_flaps_setpoint = _param_fw_flaps_to_scl.get();
+			_ctrl_configuration_handler.setEquivalentAirspeedMin(10.f);
+
+			if (height < _param_fw_sc_lift_h.get()) {
+				const float weight_scale = (PX4_ISFINITE(_vs_est) && _param_fw_sc_ff_vs.get() > FLT_EPSILON) ?
+							   math::sq(_vs_est / _param_fw_sc_ff_vs.get()) : 1.f;
+				const float thr_ff = _param_fw_sc_thr_ff.get() * sqrtf(weight_scale);
+				_scoop.throttle_cmd = math::min(_scoop.throttle_cmd + 0.5f * dt, _param_fw_thr_max.get());
+				const float pitch_target = radians(_param_fw_sc_to_pitch.get()
+								   + _param_fw_sc_p_thr.get() * math::max(_scoop.throttle_cmd - thr_ff, 0.f));
+				const float step = radians(math::max(_param_fw_lnd_fl_prt.get(), 0.5f)) * dt;
+				_scoop.pitch_cmd += math::constrain(pitch_target - _scoop.pitch_cmd, -step, step);
+				lon_sp.pitch_direct = _scoop.pitch_cmd;
+				lon_sp.throttle_direct = _scoop.throttle_cmd;
+				lon_sp.height_rate = 1.f;
+				_ctrl_configuration_handler.setPitchMax(radians(_param_fw_p_lim_max.get()));
+
+			} else {
+				// airborne: TECS climb; the airspeed setpoint starts at the liftoff airspeed and comes down at
+				// FW_SC_CLB_DEC m/s^2, so the excess speed is not turned into a zoom (7b round 4: +14 deg, throttle 6 %)
+				if (_scoop.liftoff_airspeed <= 0.f) {
+					_scoop.liftoff_airspeed = _airspeed_eas;
+					_scoop.liftoff_time = now;
+				}
+
+				const float since = (now - _scoop.liftoff_time) * 1e-6f;
+				const float trim = _param_fw_airspd_trim.get();
+				lon_sp.altitude = _scoop.water_amsl + _param_fw_sc_done_h.get() + 10.f;
+				lon_sp.equivalent_airspeed = math::max(trim, _scoop.liftoff_airspeed - _param_fw_sc_clb_dec.get() * since);
+				_ctrl_configuration_handler.setPitchMax(radians(_param_fw_sc_to_pitch.get() + 2.f));
+			}
+
+			if (height > _param_fw_sc_done_h.get()) {
+				char detail[96] {};
+				snprintf(detail, sizeof(detail), "t=%.1f v=%.1f-%.1f d=%.1f a=%.1f k=%d", (double)_scoop.scoop_time,
+					 (double)_scoop.speed_lo, (double)_scoop.speed_hi, (double)_scoop.out_of_band, (double)_scoop.out_of_abort_band,
+					 _scoop.out_of_abort_band < 0.05f ? 1 : 0);
+				setScoopPhase(now, ScoopPhase::DONE, detail);
+			}
+
+			break;
+		}
+
+	case ScoopPhase::DONE: {
+			// TECS already flies (climb at trim): stay on the line climbing while the navigator is still on a water
+			// waypoint, then hand back to the mission
+			if (pos_sp_curr.valid && fabsf(pos_sp_curr.alt - _scoop.water_amsl) < 2.f) {
+				lon_sp.altitude = math::max(_current_altitude, _scoop.water_amsl + _param_fw_sc_clb_h.get());
+				_ctrl_configuration_handler.setPitchMax(radians(_param_fw_sc_to_pitch.get() + 2.f));
+
+			} else {
+				_scoop.phase = ScoopPhase::OFF;
+				_scoop.armed = false;
+				return;
+			}
+
+			break;
+		}
+
+	case ScoopPhase::ABORT: {
+			// go-around: wings level on the line, full power climb to FW_SC_GA_ALT over the water, then AUTO.LOITER
+			// (the planner decides what comes next). On the water: takeoff pitch first.
+			const float ga_alt = _scoop.water_amsl + _param_fw_sc_ga_alt.get();
+
+			if (height < _param_fw_sc_ga_h.get()) {
+				_flaps_setpoint = _param_fw_flaps_to_scl.get();
+				const float step = radians(math::max(_param_fw_lnd_fl_prt.get(), 0.5f)) * dt * 2.f;
+				_scoop.pitch_cmd += math::constrain(radians(_param_fw_sc_to_pitch.get() + 2.f) - _scoop.pitch_cmd, -step, step);
+				_scoop.throttle_cmd = math::min(math::max(_scoop.throttle_cmd, 0.5f) + 0.5f * dt, _param_fw_thr_max.get());
+				lon_sp.pitch_direct = _scoop.pitch_cmd;
+				lon_sp.throttle_direct = _scoop.throttle_cmd;
+				lon_sp.height_rate = 2.f;
+				_ctrl_configuration_handler.setPitchMax(radians(_param_fw_p_lim_max.get()));
+
+			} else {
+				lon_sp.altitude = ga_alt;
+				_scoop.pitch_cmd = _pitch;
+				_scoop.throttle_cmd = _param_fw_thr_max.get();
+			}
+
+			_ctrl_configuration_handler.setEquivalentAirspeedMin(10.f);
+
+			if (_current_altitude > ga_alt - 5.f && !_scoop.loiter_sent) {
+				vehicle_command_s cmd{};
+				cmd.command = vehicle_command_s::VEHICLE_CMD_DO_SET_MODE;
+				cmd.param1 = 1.f;   // custom mode
+				cmd.param2 = 4.f;   // PX4_CUSTOM_MAIN_MODE_AUTO
+				cmd.param3 = 3.f;   // PX4_CUSTOM_SUB_MODE_AUTO_LOITER
+				cmd.target_system = _vehicle_status.system_id;
+				cmd.target_component = _vehicle_status.component_id;
+				cmd.source_system = _vehicle_status.system_id;
+				cmd.source_component = _vehicle_status.component_id;
+				cmd.from_external = false;
+				cmd.timestamp = now;
+				_vehicle_command_pub.publish(cmd);
+				_scoop.loiter_sent = true;
+				mavlink_log_info(&_mavlink_log_pub, "SU: IPTAL tamam, bekleme (AUTO.LOITER)\t");
+				_scoop.phase = ScoopPhase::OFF;
+				_scoop.armed = false;
+			}
+
+			break;
+		}
+
+	default:
+		return;
+	}
+
+	_longitudinal_ctrl_sp_pub.publish(lon_sp);
+	_ctrl_configuration_handler.setThrottleMax(_param_fw_thr_max.get());
+	(void)control_interval;
 }
