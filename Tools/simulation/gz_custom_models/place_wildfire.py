@@ -7,6 +7,7 @@ Writes scenarios/<region>_<model>.sdf, which px4-rc.gzsim spawns together with t
 The ground height comes from the same terrain tiles the simulator draws.
 """
 import argparse
+import functools
 import gzip
 import json
 import math
@@ -27,9 +28,13 @@ def zigzag_delta(values):
     return np.cumsum((values >> 1) ^ -(values & 1))
 
 
-def ground_height(data_root, region, lat, lon):
-    """Mean height of the terrain vertices within 45 m of the point (the grid spacing is about 30 m)."""
-    x, y = int((lon + 180) / TILE_DEG), int((lat + 90) / TILE_DEG)
+def data_root_dir():
+    return os.environ.get('GEO_TERRAIN_DATA', os.path.expanduser('~/.local/share/gz-geo-terrain'))
+
+
+@functools.lru_cache(maxsize=32)
+def load_tile(data_root, region, x, y):
+    """Longitudes, latitudes and heights of the vertices of one level 13 terrain tile."""
     path = os.path.join(data_root, region, 'terrain', str(LEVEL), str(x), f'{y}.terrain')
     with open(path, 'rb') as f:
         raw = f.read()
@@ -40,7 +45,12 @@ def ground_height(data_root, region, lat, lon):
     u, v, h = np.frombuffer(raw, '<u2', count=3 * count, offset=92).reshape(3, count)
     lons = x * TILE_DEG - 180 + zigzag_delta(u) / 32767 * TILE_DEG
     lats = y * TILE_DEG - 90 + zigzag_delta(v) / 32767 * TILE_DEG
-    heights = h_min + zigzag_delta(h) / 32767 * (h_max - h_min)
+    return lons, lats, h_min + zigzag_delta(h) / 32767 * (h_max - h_min)
+
+
+def ground_height(data_root, region, lat, lon):
+    """Mean height of the terrain vertices within 45 m of the point (the grid spacing is about 30 m)."""
+    lons, lats, heights = load_tile(data_root, region, int((lon + 180) / TILE_DEG), int((lat + 90) / TILE_DEG))
     east = (lons - lon) * 111320 * math.cos(math.radians(lat))
     north = (lats - lat) * 111320
     near = np.hypot(east, north) < 45
@@ -77,7 +87,7 @@ def main():
 
     with open(os.path.join(REGIONS, f'{args.region}.json')) as f:
         origin = json.load(f)['origin']
-    data_root = os.environ.get('GEO_TERRAIN_DATA', os.path.expanduser('~/.local/share/gz-geo-terrain'))
+    data_root = data_root_dir()
     origin_h = ground_height(data_root, args.region, origin['lat'], origin['lon'])
     site_h = ground_height(data_root, args.region, args.lat, args.lon)
     east, north, up = world_position((origin['lat'], origin['lon'], origin_h), (args.lat, args.lon, site_h))

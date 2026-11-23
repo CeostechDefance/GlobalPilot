@@ -1,6 +1,7 @@
 <?xml version="1.0"?>
 <!--
   A wildfire of about 60 x 60 m: flames at the ground, dark smoke near the fire and a pale column above.
+  It needs the ParticleEmitter system, which px4-rc.gzsim loads for airframes that set PX4_GZ_PARTICLES=1.
   Colours come from the textures, because Ogre2 ignores the emitter colour range.
   The emitters send particles along their +X axis, so each one is pitched up. Smoke leans about 15 degrees
   towards +X of the model; yaw the model to change the drift direction.
@@ -11,7 +12,6 @@
 <sdf version="1.9">
   <model name="wildfire">
     <static>true</static>
-    <plugin filename="gz-sim-particle-emitter-system" name="gz::sim::systems::ParticleEmitter"/>
     <link name="fire_link">
       <particle_emitter name="flames" type="box">
         <pose>0 0 2 0 -1.5708 0</pose>

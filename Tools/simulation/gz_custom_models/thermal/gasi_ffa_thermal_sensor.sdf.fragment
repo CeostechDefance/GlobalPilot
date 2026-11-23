@@ -1,0 +1,22 @@
+<!--
+  Thermal camera for gasi_ffa, to place in base_link directly after fire_camera (GstCameraSystem streams the first
+  camera). Pose, field of view and clip planes match fire_camera, so fire_locator.pixel_to_ned applies with 640 x 512.
+  Topic: /world/<world>/model/gasi_ffa_0/link/base_link/sensor/thermal_camera/image, gz.msgs.Image, L_INT16.
+  Kelvin = pixel * resolution. The default resolution of 0.01 K stops at 655.35 K, below the 900 K fire.
+-->
+<sensor name="thermal_camera" type="thermal_camera">
+  <gz_frame_id>base_link</gz_frame_id>
+  <pose>2.59226 0.00042 -0.10095 0 0.1920 0</pose>
+  <always_on>1</always_on>
+  <update_rate>15</update_rate>
+  <camera>
+    <horizontal_fov>1.0472</horizontal_fov>
+    <image><width>640</width><height>512</height><format>L16</format></image>
+    <clip><near>0.5</near><far>20000</far></clip>
+  </camera>
+  <plugin filename="gz-sim-thermal-sensor-system" name="gz::sim::systems::ThermalSensor">
+    <min_temp>253.15</min_temp>
+    <max_temp>1273.15</max_temp>
+    <resolution>0.05</resolution>
+  </plugin>
+</sensor>
