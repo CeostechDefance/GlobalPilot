@@ -1,62 +1,72 @@
-# PX4 Drone Autopilot
+# GlobalPilot
 
-[![Releases](https://img.shields.io/github/release/PX4/PX4-Autopilot.svg)](https://github.com/PX4/PX4-Autopilot/releases) [![DOI](https://zenodo.org/badge/22634/PX4/PX4-Autopilot.svg)](https://zenodo.org/badge/latestdoi/22634/PX4/PX4-Autopilot)
+GlobalPilot, Ceostech'in [PX4 Autopilot](https://github.com/PX4/PX4-Autopilot) v1.17 tabanlı uçuş yazılımıdır. Bu depo
+PX4'ün tamamını içerir; üstüne GASI FFA otonom amfibi yangın söndürme uçağı için uçuş kontrolü değişiklikleri ve Gazebo
+Harmonic simülasyonu eklenmiştir.
 
-[![Build Targets](https://github.com/PX4/PX4-Autopilot/actions/workflows/build_all_targets.yml/badge.svg?branch=main)](https://github.com/PX4/PX4-Autopilot/actions/workflows/build_all_targets.yml) [![SITL Tests](https://github.com/PX4/PX4-Autopilot/workflows/SITL%20Tests/badge.svg?branch=master)](https://github.com/PX4/PX4-Autopilot/actions?query=workflow%3A%22SITL+Tests%22)
+## GASI FFA
 
-[![Discord Shield](https://discordapp.com/api/guilds/1022170275984457759/widget.png?style=shield)](https://discord.gg/dronecode)
+GASI FFA, sudan su alıp yangına bırakan, pistten ve sudan kalkıp inebilen sabit kanatlı otonom bir uçaktır. Simülasyonda
+uçak SolidWorks STEP montajından üretilir ve gerçek arazili dünyalarda uçar.
 
-This repository holds the [PX4](http://px4.io) flight control solution for drones, with the main applications located in the [src/modules](https://github.com/PX4/PX4-Autopilot/tree/main/src/modules) directory. It also contains the PX4 Drone Middleware Platform, which provides drivers and middleware to run drones.
+### Eklenenler
 
-PX4 is highly portable, OS-independent and supports Linux, NuttX and MacOS out of the box.
+| Konu | Yer |
+|---|---|
+| İniş flare yasaları 3–6 (`FW_LND_FL_LAW`; 6: kütleden bağımsız, pist ve su için yüzey profilli) | `src/modules/fw_mode_manager`, `src/modules/fw_lateral_longitudinal_control`, `src/lib/fw_performance_model` |
+| PX4 içinde su alma: yaklaşma, kapı kontrolü, flare, değme, hız bandında su alma, kalkış ve iptal (`FW_SC_*`) | `src/modules/fw_mode_manager` |
+| Su alma görev maddesi `MAV_CMD_USER_1` | `src/modules/navigator`, `src/modules/mavlink/mavlink_mission.cpp` |
+| Gazebo eklentileri: iniş takımı sırası, burun tekeri yönlendirme, tekerlek freni | `src/modules/simulation/gz_plugins` |
+| Uçak modeli ve airframe | `Tools/simulation/gz_custom_models/gasi_ffa`, `generate_gasi_ffa.py`, `ROMFS/.../airframes/4022_gz_gasi_ffa` |
+| Gerçek arazi, su yüzeyi ve su fiziği, pist ve bina üreticileri (alt modül) | `Tools/simulation/gz_geo_terrain` |
+| Yangın modeli, yangın kamerası, ısıl kamera | `Tools/simulation/gz_custom_models/wildfire*`, `thermal/` |
+| Yangına müdahale görevi, su bölümü, görev planlayıcı | `Tools/simulation/gz_custom_models/scenarios` |
 
-* Official Website: http://px4.io (License: BSD 3-clause, [LICENSE](https://github.com/PX4/PX4-Autopilot/blob/main/LICENSE))
-* [Supported airframes](https://docs.px4.io/main/en/airframes/airframe_reference.html) ([portfolio](https://px4.io/ecosystem/commercial-systems/)):
-  * [Multicopters](https://docs.px4.io/main/en/frames_multicopter/)
-  * [Fixed wing](https://docs.px4.io/main/en/frames_plane/)
-  * [VTOL](https://docs.px4.io/main/en/frames_vtol/)
-  * [Autogyro](https://docs.px4.io/main/en/frames_autogyro/)
-  * [Rover](https://docs.px4.io/main/en/frames_rover/)
-  * many more experimental types (Blimps, Boats, Submarines, High Altitude Balloons, Spacecraft, etc)
-* Releases: [Downloads](https://github.com/PX4/PX4-Autopilot/releases)
+Ayrıntılar: [gz_custom_models/README.md](Tools/simulation/gz_custom_models/README.md) (uçak modeli, senaryolar) ve
+[gz_geo_terrain/README.md](https://github.com/CeostechDefance/gz-geo-terrain) (arazi, su, dünyalar).
 
-## Releases
+### Kurulum
 
-Release notes and supporting information for PX4 releases can be found on the [Developer Guide](https://docs.px4.io/main/en/releases/).
+```bash
+git clone --recursive git@github.com:CeostechDefance/GlobalPilot.git
+# klonlandıysa: git submodule update --init --recursive
+```
 
-## Building a PX4 based drone, rover, boat or robot
+PX4'ün geliştirme ortamı ([Ubuntu kurulumu](https://docs.px4.io/main/en/dev_setup/dev_env_linux_ubuntu.html)) ve Gazebo
+Harmonic gerekir. Arazi verisinin hazırlanması `gz_geo_terrain` README'sinde anlatılır.
 
-The [PX4 User Guide](https://docs.px4.io/main/en/) explains how to assemble [supported vehicles](https://docs.px4.io/main/en/airframes/airframe_reference.html) and fly drones with PX4. See the [forum and chat](https://docs.px4.io/main/en/#getting-help) if you need help!
+### Simülasyon
 
+```bash
+make px4_sitl gz_gasi_ffa_antalya     # Antalya (LTAI)
+make px4_sitl gz_gasi_ffa_dalaman     # Dalaman (LTBS), su alma senaryosu bu dünyada
+```
 
-## Changing Code and Contributing
+`Tools/simulation/gz_geo_terrain/worlds/` altındaki her dünya `gz_gasi_ffa_<dünya>` adıyla açılır (ör. `rothenburg`,
+`welzow`).
 
-This [Developer Guide](https://docs.px4.io/main/en/development/development.html) is for software developers who want to modify the flight stack and middleware (e.g. to add new flight modes), hardware integrators who want to support new flight controller boards and peripherals, and anyone who wants to get PX4 working on a new (unsupported) airframe/vehicle.
+Yangına müdahale görevi, simülasyon açıkken:
 
-Developers should read the [Guide for Contributions](https://docs.px4.io/main/en/contribute/).
-See the [forum and chat](https://docs.px4.io/main/en/#getting-help) if you need help!
+```bash
+python3 Tools/simulation/gz_custom_models/scenarios/fire_attack.py --world dalaman --scoop
+```
 
+Yangını kamerayla arar, konumunu hesaplar, sudan su alır ve yangına bırakır, sonra piste döner. Su alma varsayılan olarak
+görev bilgisayarı tarafında yürütülür; `GASI_SU_PX4=1` ile PX4 içindeki su alma kullanılır.
 
-## Weekly Dev Call
+Senaryo testleri:
 
-The PX4 Dev Team syncs up on a [weekly dev call](https://docs.px4.io/main/en/contribute/).
+```bash
+cd Tools/simulation/gz_custom_models/scenarios && python3 -m pytest -q tests
+```
 
-> **Note** The dev call is open to all interested developers (not just the core dev team). This is a great opportunity to meet the team and contribute to the ongoing development of the platform. It includes a QA session for newcomers. All regular calls are listed in the [Dronecode calendar](https://www.dronecode.org/calendar/).
+### Sınırlar
 
+Aerodinamik katsayılar CAD'den ve kuyruk hacmi yöntemiyle tahmin edilmiştir; rüzgâr tüneli, CFD ya da uçuş verisiyle
+ayarlanmamıştır. Su fiziğindeki basınç ve direnç katsayıları da tahmindir. Simülasyondaki davranış gerçek uçağın tahmini
+değil, makul bir yaklaşıktır.
 
-## Maintenance Team
+## PX4
 
-See the latest list of maintainers on [MAINTAINERS](MAINTAINERS.md) file at the root of the project.
-
-For the latest stats on contributors please see the latest stats for the Dronecode ecosystem in our project dashboard under [LFX Insights](https://insights.lfx.linuxfoundation.org/foundation/dronecode). For information on how to update your profile and affiliations please see the following support link on how to [Complete Your LFX Profile](https://docs.linuxfoundation.org/lfx/my-profile/complete-your-lfx-profile). Dronecode publishes a yearly snapshot of contributions and achievements on its [website under the Reports section](https://dronecode.org).
-
-## Supported Hardware
-
-For the most up to date information, please visit [PX4 User Guide > Autopilot Hardware](https://docs.px4.io/main/en/flight_controller/).
-
-## Project Governance
-
-The PX4 Autopilot project including all of its trademarks is hosted under [Dronecode](https://www.dronecode.org/), part of the Linux Foundation.
-
-<a href="https://www.dronecode.org/" style="padding:20px" ><img src="https://dronecode.org/wp-content/uploads/sites/24/2020/08/dronecode_logo_default-1.png" alt="Dronecode Logo" width="110px"/></a>
-<div style="padding:10px">&nbsp;</div>
+Uçuş yazılımının temeli PX4'tür: [px4.io](https://px4.io), [kullanıcı ve geliştirici rehberi](https://docs.px4.io/main/en/).
+Lisans BSD 3-clause ([LICENSE](LICENSE)).
