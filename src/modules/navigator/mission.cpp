@@ -222,6 +222,13 @@ void Mission::setActiveMissionItems()
 			pos_sp_triplet->current.alt_acceptance_radius = FLT_MAX;
 		}
 
+		// GASI su alma: su yüzeyindeki noktalar yalnız yatayda kabul edilir
+		if (_vehicle_status_sub.get().vehicle_type == vehicle_status_s::VEHICLE_TYPE_FIXED_WING
+		    && _mission_item.nav_cmd == NAV_CMD_WAYPOINT && PX4_ISFINITE(_scoop_water_amsl)
+		    && fabsf(get_absolute_altitude_for_item(_mission_item) - _scoop_water_amsl) < 2.0f) {
+			pos_sp_triplet->current.alt_acceptance_radius = FLT_MAX;
+		}
+
 		// Allow a rotary wing vehicle to decelerate before reaching a wp with a hold time or a timeout
 		// This is done by setting the position triplet's next position's valid flag to false,
 		// which makes the FlightTask disregard the next position
@@ -271,6 +278,10 @@ void Mission::setActiveMissionItems()
 	if ((_work_item_type != WorkItemType::WORK_ITEM_TYPE_MOVE_TO_LAND) &&
 	    !position_setpoint_equal(&pos_sp_triplet->current, &current_setpoint_copy)) {
 		pos_sp_triplet->previous = current_setpoint_copy;
+	}
+
+	if (_mission_item.nav_cmd == NAV_CMD_USER_1) {
+		_scoop_water_amsl = (_mission_item.params[0] > 0.5f) ? _mission_item.params[6] : NAN;
 	}
 
 	issue_command(_mission_item);

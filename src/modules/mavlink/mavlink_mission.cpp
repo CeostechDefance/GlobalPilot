@@ -1627,6 +1627,7 @@ MavlinkMissionManager::parse_mavlink_mission_item(const mavlink_mission_item_t *
 		case MAV_CMD_CONDITION_DELAY:
 		case MAV_CMD_CONDITION_DISTANCE:
 		case MAV_CMD_DO_SET_ACTUATOR:
+		case MAV_CMD_USER_1: // GASI su alma adımı
 		case MAV_CMD_COMPONENT_ARM_DISARM:
 			mission_item->nav_cmd = (NAV_CMD)mavlink_mission_item->command;
 			break;

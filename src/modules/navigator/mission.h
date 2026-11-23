@@ -69,6 +69,9 @@ public:
 
 
 private:
+	// GASI su alma: USER_1 (param1 1) ile kurulur, su yüzeyi AMSL (param7). Su yüzeyindeki görev noktaları yükseklikten
+	// bağımsız kabul edilir (fw_mode_manager su alma aşamalarını uçar; uçak noktanın üstünde de olabilir)
+	float _scoop_water_amsl{NAN};
 
 	bool setNextMissionItem() override;
 
