@@ -11,19 +11,33 @@
 
 PX4_SIMULATOR=${PX4_SIMULATOR:=gz}
 PX4_GZ_WORLD=${PX4_GZ_WORLD:=default}
+
+# model.sdf points the nose along Antalya runway 36C. Dalaman starts at the north end of runway 19, heading 195.68; z is on the runway surface of the world.
+if [ "${PX4_GZ_WORLD}" = "dalaman" ]
+then
+	PX4_GZ_MODEL_POSE=${PX4_GZ_MODEL_POSE:=0,0,1.9156,0,0,-1.8444}
+elif [ "${PX4_GZ_WORLD}" = "antalya" ]
+then
+	# Runway 36C centreline next to the origin (1.9 m off it), heading 6.27; z on the runway surface of the world
+	PX4_GZ_MODEL_POSE=${PX4_GZ_MODEL_POSE:=-1.877,0.206,1.4041,0,0,1.4614}
+fi
 PX4_SIM_MODEL=${PX4_SIM_MODEL:=gasi_ffa}
 
 # Keep the Gazebo window on the aircraft. Set PX4_GZ_FOLLOW= (empty) to turn it off.
 if [ -z "${HEADLESS}" ]
 then
 	PX4_GZ_FOLLOW=${PX4_GZ_FOLLOW-1}
-	PX4_GZ_FOLLOW_OFFSET_X=${PX4_GZ_FOLLOW_OFFSET_X:=-22}
-	PX4_GZ_FOLLOW_OFFSET_Y=${PX4_GZ_FOLLOW_OFFSET_Y:=-22}
-	PX4_GZ_FOLLOW_OFFSET_Z=${PX4_GZ_FOLLOW_OFFSET_Z:=8}
+	PX4_GZ_FOLLOW_OFFSET_X=${PX4_GZ_FOLLOW_OFFSET_X:=-5}
+	PX4_GZ_FOLLOW_OFFSET_Y=${PX4_GZ_FOLLOW_OFFSET_Y:=-4}
+	PX4_GZ_FOLLOW_OFFSET_Z=${PX4_GZ_FOLLOW_OFFSET_Z:=1}
+	PX4_GZ_FOLLOW_PGAIN=${PX4_GZ_FOLLOW_PGAIN:=1}
 fi
 
 # Send fire_camera to QGroundControl on UDP port 5600. Set PX4_GZ_VIDEO_STREAM=0 to turn it off.
 PX4_GZ_VIDEO_STREAM=${PX4_GZ_VIDEO_STREAM:=1}
+
+# Water curtain and test fire are particle emitters.
+PX4_GZ_PARTICLES=1
 
 param set-default SIM_GZ_EN 1
 
@@ -35,65 +49,110 @@ param set-default SIM_GZ_EN_BARO 0
 
 param set-default FD_ESCS_EN 0
 
-# Airspeeds: stall about 25 m/s at full load in the aerodynamic model.
-param set-default FW_AIRSPD_STALL 27
-param set-default FW_AIRSPD_MIN 33
+# Airspeeds at MTOW 1200 kg in the aerodynamic model: stall 28.4 m/s clean, 26.4 m/s with 32 deg flaps.
+# PX4 limits every airspeed setpoint, landing included, to FW_AIRSPD_MIN times the flap factor, so the flap factor is
+# the stall ratio at full flaps (40 deg): with 32 deg the floor is 34.5 m/s, under FW_LND_AIRSPD.
+param set-default FW_AIRSPD_STALL 29
+param set-default FW_AIRSPD_MIN 37
+param set-default FW_AIRSPD_FLP_SC 0.915
 param set-default FW_AIRSPD_TRIM 45
 param set-default FW_AIRSPD_MAX 65
 
-# Thrust grows with the square of the command: cruise with the gear up needs about 32 %.
-param set-default FW_THR_TRIM 0.57
+# Thrust grows with the square of the command: cruise with the gear up needs about 19 % of 5000 N.
+param set-default FW_THR_TRIM 0.44
 param set-default FW_THR_MIN 0.05
 param set-default FW_THR_MAX 1.0
 
 param set-default FW_T_CLMB_R_SP 4
-param set-default FW_T_CLMB_MAX 5
+param set-default FW_T_CLMB_MAX 4
 param set-default FW_T_SINK_MAX 5
 param set-default FW_T_SINK_MIN 2.5
 
 param set-default FW_P_LIM_MAX 15
 param set-default FW_P_LIM_MIN -12
-param set-default FW_R_LIM 35
+param set-default FW_R_LIM 25
 param set-default FW_R_TC 0.6
-param set-default FW_P_TC 0.6
+# Pitch time constant 0.4 (was 0.6): with the empty tank (800 kg) the same lift change gives 1.5x the vertical
+# acceleration and 0.6 left a 4.6 s altitude oscillation of +-1-2 m/s after turns; 0.4 holds both 800 and 1200 kg
+# (2026-11-08 TECS tests, p95 vertical speed 10-20 s after a turn: empty 1.40 -> 0.31, full 0.28 -> 0.16).
+param set-default FW_P_TC 0.4
 
-param set-default FW_R_RMAX 40
+# Weight: the TECS and airspeed settings are tuned at the full weight (1200 kg). The mission script writes the actual
+# weight to WEIGHT_GROSS before arming (800 kg with an empty tank) and back to 1200 after landing; PX4 then scales
+# the TECS throttle gain (through the maximum climb rate; the climb setpoint FW_T_CLMB_R_SP stays 4) and the trim,
+# minimum and stall airspeeds (empty: trim 45 -> 37 m/s, the FW_AIRSPD_MIN floor). Without it the empty aircraft
+# oscillated +-1.5 m/s in the climb (2026-11-08 TECS tests: 3.3 -> 0.3 m/s peak to peak; user choice WEIGHT_GROSS).
+param set-default WEIGHT_BASE 1200
+param set-default WEIGHT_GROSS 1200
+
+param set-default FW_R_RMAX 15
 param set-default FW_P_RMAX_POS 20
 param set-default FW_P_RMAX_NEG 25
 
-param set-default FW_RR_FF 0.25
-param set-default FW_RR_P 0.08
-param set-default FW_RR_I 0.05
+# The ailerons are the outer 1.1 m of each wing surface: 0.44 of the roll power of the whole surface, so the roll gains are 2.26 times
+# the values tuned on the whole surface.
+param set-default FW_RR_FF 0.565
+param set-default FW_RR_P 0.18
+param set-default FW_RR_I 0.113
 param set-default FW_PR_FF 0.35
-param set-default FW_PR_P 0.45
+param set-default FW_PR_P 0.9
 param set-default FW_PR_I 0.15
 param set-default FW_YR_FF 0.3
 param set-default FW_YR_P 0.2
 param set-default FW_YR_I 0.05
 
 param set-default NPFG_PERIOD 20
-param set-default NAV_ACC_RAD 60
+# The turn radius at the 25 deg limit and 45 m/s is about 440 m. Fixed wing ignores a mission item's own radius: fire_attack.py moves the points it must fly up to.
+param set-default NAV_ACC_RAD 440
 param set-default NAV_DLL_ACT 0
 param set-default MIS_TAKEOFF_ALT 60
 
 # Runway takeoff. The thrust line is 0.91 m above the CG and the main gear reaction vanishes at
-# liftoff, so a wound-up elevator throws the nose up. Limit the integrator and the pitch rate
-# instead of the thrust: at reduced thrust the aircraft does not reach flying speed cleanly.
+# liftoff, so a wound-up elevator throws the nose up. Limit the integrator and the pitch rate.
+# Takeoff thrust is 3000 N (0.77 squared of 5000 N): at full thrust the end of the takeoff phase cuts
+# about 4500 N m of nose-down moment at once and the nose jumps at 18 deg/s, against 9 deg/s at 3000 N.
+param set-default RWTO_MAX_THR 0.77
 param set-default RWTO_TKOFF 1
-param set-default RWTO_ROT_AIRSPD 36
+# Rotation at 1.3 times the empty stall with 18 deg flaps (about 22 m/s). At 38 m/s the empty wing nearly lifts the
+# aircraft while the nose is still held down, the main wheels unload and the nose wheel carries it: yaw ran away on the ground.
+param set-default RWTO_ROT_AIRSPD 30
 param set-default RWTO_RAMP_TIME 3
-param set-default FW_TKO_PITCH_MIN 8
+# Takeoff climb matches FW_T_CLMB_MAX: with the takeoff airspeed at cruise speed (45) and a 4 deg pitch floor the spare
+# thrust goes into speed, so the empty aircraft ends the takeoff at about 3.9 m/s and 43 m/s. With 37 m/s and 8 deg it climbed
+# at 7-8 m/s, and when the takeoff ended TECS (limited to 4 m/s) pitched down to -8 deg and the aircraft sank 3-7 m
+# (2026-11-08, empty tank). Cost: about 60 m longer ground run to 5 m height (279 -> 338 m, empty tank).
+param set-default FW_TKO_AIRSPD 45
+param set-default FW_TKO_PITCH_MIN 4
+# At the end of the climbout PX4 retracted the flaps (18 deg -> 0 in 1.75 s), dropped the 4 deg pitch floor and freed the
+# 0.77 takeoff throttle at once: the nose fell to -2.6 deg and then rose to +12 deg. FW_TKO_BLEND_T releases all three over
+# 10 s: empty tank pitch -1.3..+6.7 deg instead of -0.3..+10 (2026-11-08, n=2), full tank -2.1..+5.5 instead of -2.0..+7.7.
+param set-default FW_TKO_BLEND_T 10
 param set-default FW_PR_IMAX 0.2
 
-# The rudder steers on the ground: the nose wheel has no steering joint.
+# Yaw control on the ground, through the rudder and the nose wheel.
 param set-default FW_W_EN 1
 
 # Landing: no range sensor, so the approach uses the altitude of the landing point.
-param set-default FW_LND_ANG 4
+param set-default FW_LND_ANG 3
 param set-default FW_LND_ABORT 0
 param set-default FW_LND_USETER 0
-param set-default FW_LND_FLALT 8
 param set-default FW_LND_AIRSPD 35
+# Flare: autoland style (FW_LND_FL_LAW 3). The sink rate follows height linearly from the approach sink rate at 10 m
+# to 0.5 m/s at 1 m (exponential flare) and drives pitch directly through a PI, without TECS.
+# Measured with the 2026-11-08 model: empty tank touchdown 0.67-0.91 m/s, no balloon (7 flights);
+# full tank 1.15-1.21 m/s but pitch 5.5-8.6 deg and airspeed 27-28 m/s at touchdown, close to tail strike and stall.
+param set-default FW_LND_FL_LAW 3
+param set-default FW_LND_FLALT 10
+param set-default FW_LND_FL_SINK 0.5
+param set-default FW_LND_FL_HOLD 1
+# Pitch floor in the flare (user decision 2026-11-10, "şimdilik 3.5"): runway touchdown pitch about +5.0 deg empty / +4.5 deg full
+# instead of +1.0 deg with 0. Measured (2 flights each where valid): empty 3.0 -> +4.3 deg, -1.2 m/s, 1.06 Vs; 3.5 -> +5.0 deg,
+# -1.07 m/s, 1.05 Vs; 4.5 -> +6.0 deg, -1.25 m/s, 1.02 Vs (at the stall). Full 3.5 -> +4.5 deg, -0.71 m/s, 1.08 Vs.
+param set-default FW_LND_FL_PMIN 3.5
+# KP/KI retuned for FW_P_TC 0.4 (2026-11-08): with KP 5 / KI 2 the faster pitch loop oscillated -7..+10 deg over water and did
+# not touch down. KP 2 / KI 1.2: runway empty 0.65-0.80 m/s, full 1.36-1.56 m/s (pitch 3-5 deg); water empty 0.61-0.66, full 0.47.
+param set-default FW_LND_FL_KP 2
+param set-default FW_LND_FL_KI 1.2
 
 param set-default CA_AIRFRAME 1
 
@@ -103,9 +162,9 @@ param set-default COM_PREARM_MODE 2
 # 0.91 m up) makes the allocator trade thrust for pitch torque. The rate loop handles that moment.
 param set-default CA_ROTOR_COUNT 1
 
-# The wing surfaces work as ailerons only. Retracted flaps are -1 in the allocator, so a
-# CA_SV_CSn_FLAP scale here would hold them deflected in cruise and jump them on approach.
-param set-default CA_SV_CS_COUNT 4
+# Control surface 4 is the flap pair. PX4 sets it only in the takeoff and landing phases: 0.45 = 18 deg, 0.8 = 32 deg.
+# CA_SV4_SLEW stretches the travel to 2.7 s for 32 deg.
+param set-default CA_SV_CS_COUNT 5
 param set-default CA_SV_CS0_TRQ_R -0.5
 param set-default CA_SV_CS0_TYPE 1
 param set-default CA_SV_CS1_TRQ_R 0.5
@@ -114,10 +173,15 @@ param set-default CA_SV_CS2_TRQ_P 1
 param set-default CA_SV_CS2_TYPE 3
 param set-default CA_SV_CS3_TRQ_Y 1
 param set-default CA_SV_CS3_TYPE 4
+param set-default CA_SV_CS4_FLAP 1
+param set-default CA_SV4_SLEW 3.33
+param set-default FW_FLAPS_TO_SCL 0.45
+param set-default FW_FLAPS_LND_SCL 0.8
 
 param set-default SIM_GZ_EC_FUNC1 101
 param set-default SIM_GZ_EC_MIN1 0
-param set-default SIM_GZ_EC_MAX1 1000
+# 4400 rpm in rad/s; maxRotVelocity in model.sdf clamps it to 460.77.
+param set-default SIM_GZ_EC_MAX1 461
 
 param set-default SIM_GZ_SV_FUNC1 201
 param set-default SIM_GZ_SV_FUNC2 202
@@ -126,7 +190,18 @@ param set-default SIM_GZ_SV_FUNC4 204
 
 # Landing gear: down = -45, up = +45, disarmed = 0. GearSequencerSystem reads only the sign, so
 # every value except an explicit up command means gear down.
-param set-default SIM_GZ_SV_FUNC5 400
+# Landing gear by MAV_CMD_DO_SET_ACTUATOR (Peripheral via Actuator Set 1), not PX4's landing gear function (400): that one
+# only raised the gear once the runway takeoff passed CLIMBOUT, which a short takeoff step skipped. The missions raise the
+# gear right after takeoff and lower it before the final approach; PX4 no longer lowers it by itself (RTL, manual landing).
+param set-default SIM_GZ_SV_FUNC5 301
+
+# Nose wheel steering: NoseSteeringSystem takes this output and limits the angle by ground speed.
+# PX4 holds the yaw it has when the landing phase starts; it does not steer back to the runway line.
+# The wheel integrator is off: in the air it wound up and turned the aircraft on touchdown.
+param set-default SIM_GZ_SV_FUNC6 440
+param set-default FW_WR_I 0
+param set-default SIM_GZ_SV_MAXA6 30
+param set-default SIM_GZ_SV_MINA6 -30
 
 param set-default SIM_GZ_SV_MAXA1 30
 param set-default SIM_GZ_SV_MINA1 -30
@@ -136,3 +211,9 @@ param set-default SIM_GZ_SV_MAXA3 25
 param set-default SIM_GZ_SV_MINA3 -25
 param set-default SIM_GZ_SV_MAXA4 25
 param set-default SIM_GZ_SV_MINA4 -25
+
+# Flaps on servo_6: retracted at the minimum and when disarmed, 40 deg trailing edge down at the maximum.
+param set-default SIM_GZ_SV_FUNC7 205
+param set-default SIM_GZ_SV_MINA7 0
+param set-default SIM_GZ_SV_MAXA7 -40
+param set-default SIM_GZ_SV_DIS7 0
