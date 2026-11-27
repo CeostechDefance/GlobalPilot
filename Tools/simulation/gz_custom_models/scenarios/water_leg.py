@@ -35,9 +35,12 @@ GROUND_ROLL_HEADING_DEG = 5.0
 LAND_REL_M = 0.0                  # iniş noktasında pist, eve göre; tek başına deneme ayarlar
 
 # Kabul şartı: su alma penceresinin süresi ve o süredeki Gazebo hızı. Sudan ayrılmanın süre şartı yok, ayrı raporlanır.
+# Hız sınırları PX4 parametrelerinden (kullanıcı 2026-11-27; otonom/planlayici/su_alma.py HizSiniri): gaz kontrol bandını
+# (SPEED_MIN_MS .. FW_SC_VMAX) hedefler, pencere ve dolum orada; su alma ancak iptal bandı (FW_SC_A_VMIN .. FW_SC_A_VMAX)
+# dışında toplam FW_SC_OOB_T'den uzun kalınırsa başarısız. Önceden sabit 80-100 km/h ve bant dışı süre sıfırdı.
 SCOOP_MIN_S, SCOOP_MAX_S = 8.0, 12.0
-SPEED_MIN_MS, SPEED_MAX_MS = 80 / 3.6, 100 / 3.6  # 80-100 km/h, yuvarlatmadan
-WINDOW_START_MS = 27.5            # pencere burada başlar: 0,5 s'lik hız ölçümü üst sınırı aşmasın
+SPEED_MIN_MS = 80 / 3.6           # kontrol bandı alt sınırı (PX4 yolunda görev maddesinin param4'ü), yuvarlatmadan
+HIZ_SINIRI = None                 # SA.HizSiniri; fire_attack yerde PX4'ten okur, yoksa su bölümü başında okunur
 SCOOP_TARGET_S = 10.0
 SPEED_TARGET_MS = 25.0
 THROTTLE_PARAM = b'FW_THR_MAX'
@@ -366,6 +369,12 @@ def read_param(vehicle, name, timeout=3.0):
     return None
 
 
+def hiz_siniri(vehicle):
+    """Su alma hız sınırları (SA.HizSiniri): yerde okunmuşsa o, değilse şimdi PX4'ten. Okunamazsa RuntimeError."""
+    from otonom.planlayici import su_alma as SA
+    return HIZ_SINIRI or SA.hiz_siniri_px4(lambda name: read_param(vehicle, name.encode()))
+
+
 def set_param(vehicle, name, value):
     vehicle.link.mav.param_set_send(vehicle.link.target_system, vehicle.link.target_component, name, float(value),
                                     M.MAV_PARAM_TYPE_REAL32)
@@ -394,9 +403,11 @@ def run_water_leg(vehicle, home, model, timeout=720.0, log=print, offboard_align
     offboard_alignment: None (varsayılan, eski davranış) ya da dict(record=<jsonl yolu>, empty_mass_kg, default_mass_kg).
     Verilirse suya hizalanma ve değiş offboard durum makinesiyle (otonom.hizalanma) yapılır; su alma ve gaz mantığı aynı kalır.
 
-    ok yalnızca pencere SCOOP_MIN_S-SCOOP_MAX_S sürüp hız SPEED_MIN_MS-SPEED_MAX_MS içinde kaldıysa, gaz sınırı geri
-    alındıysa ve uçak sudan ayrılıp RELEASE_ABOVE_WATER_M üstüne çıktıysa True.
+    ok yalnızca pencere SCOOP_MIN_S-SCOOP_MAX_S sürüp hız PX4 iptal bandı (FW_SC_A_VMIN-FW_SC_A_VMAX) dışında toplam
+    FW_SC_OOB_T'den uzun kalmadıysa, gaz sınırı geri alındıysa ve uçak sudan ayrılıp RELEASE_ABOVE_WATER_M üstüne
+    çıktıysa True.
     """
+    from otonom.planlayici import su_alma as SA
     started = time.time()
     home = tuple(home[:2])  # fire_attack (enlem, boylam, AMSL) verir
     surface = WaterSurface(home)
@@ -411,9 +422,17 @@ def run_water_leg(vehicle, home, model, timeout=720.0, log=print, offboard_align
         f"tırmanış sonu {info['climb_end'][0]:.4f},{info['climb_end'][1]:.4f}")
     climb_seq = next(k for k, item in enumerate(items) if item['name'] == 'Tırmanış')
     result = dict(ok=False, reason='zaman aşımı', contact_s=0.0, scoop_s=None, speed_min=None, speed_max=None, entered_speed=None,
-                  decel_s=None, decel_distance_m=None, decel_speed_max=None, liftoff_s=None, liftoff_distance_m=None, out_of_band_s=0.0, liftoff_speed=None, liftoff_pitch_up_deg=None,
+                  decel_s=None, decel_distance_m=None, decel_speed_max=None, liftoff_s=None, liftoff_distance_m=None, out_of_band_s=0.0,
+                  out_of_abort_s=0.0, liftoff_speed=None, liftoff_pitch_up_deg=None,
                   exit_aoa_deg=None, airspeed_min=None, lowest=None, max_roll=0.0, wheel_z=None, water_height=info['water_height'],
                   climb_end=info['climb_end'], throttle_original=None, throttle_after=None, throttle_restored=None)
+    try:
+        siniri = hiz_siniri(vehicle)
+    except RuntimeError as error:
+        result['reason'] = f'{error}; su bölümü başlatılmadı'
+        log(result['reason'])
+        result.update(lat=vehicle.state['lat'], lon=vehicle.state['lon'], seconds=time.time() - started)
+        return result
     # Takım açıkken suya girmek uçağı devirir (ölçüldü): görev yüklenmeden denetlenir, ölçülemiyorsa da başlanmaz
     gear_end = time.time() + GEAR_WAIT_S
     wheel = telemetry.snapshot()[3]
@@ -508,7 +527,7 @@ def run_water_leg(vehicle, home, model, timeout=720.0, log=print, offboard_align
 
                 if window_start is None:
                     result['decel_speed_max'] = max(result['decel_speed_max'], speed)
-                    if SPEED_MIN_MS <= speed <= WINDOW_START_MS:
+                    if SPEED_MIN_MS <= speed <= siniri.kontrol_ust_ms:
                         window_start = sim
                         result.update(decel_s=sim - contact_start, speed_min=speed, speed_max=speed,
                                       decel_distance_m=math.dist(position[:2], contact_position[:2]))
@@ -516,8 +535,11 @@ def run_water_leg(vehicle, home, model, timeout=720.0, log=print, offboard_align
                 elif window_end is None:
                     result['speed_min'] = min(result['speed_min'], speed)
                     result['speed_max'] = max(result['speed_max'], speed)
-                    if not SPEED_MIN_MS <= speed <= SPEED_MAX_MS and window_last is not None:
-                        result['out_of_band_s'] += sim - window_last
+                    if window_last is not None:
+                        if not SPEED_MIN_MS <= speed <= siniri.kontrol_ust_ms:
+                            result['out_of_band_s'] += sim - window_last
+                        if not siniri.iptal_alt_ms <= speed <= siniri.iptal_ust_ms:
+                            result['out_of_abort_s'] += sim - window_last
                     window_last = sim
                     if sim - window_start >= SCOOP_TARGET_S:
                         window_end = sim
@@ -536,7 +558,7 @@ def run_water_leg(vehicle, home, model, timeout=720.0, log=print, offboard_align
                     throttle_speed, throttle_time = speed, sim
                     # Momentum direnci yalnız dolumda (hız bandında) vardır; yavaşlarken eklenirse uçak yavaşlayamaz
                     # (n9: ek gaz her durumda verildi, 45 m/s'den 27,5'e inmek 6,4 km sürdü)
-                    filling = predicted <= WINDOW_START_MS
+                    filling = predicted <= siniri.kontrol_ust_ms
                     base = math.sqrt(THROTTLE_BASE ** 2 + (SCOOP_FILL_RATE_KGS * speed / THRUST_MAX_N if filling else 0.0))
                     command = max(THROTTLE_MIN, min(THROTTLE_MAX, base + THROTTLE_GAIN * (SPEED_TARGET_MS - predicted)))
                     if throttle_sent is None or abs(command - throttle_sent) >= THROTTLE_MIN_CHANGE:
@@ -590,8 +612,9 @@ def run_water_leg(vehicle, home, model, timeout=720.0, log=print, offboard_align
                 else:
                     if not SCOOP_MIN_S <= result['scoop_s'] <= SCOOP_MAX_S:
                         problems.append(f"pencere {result['scoop_s']:.1f} s, şart {SCOOP_MIN_S:.0f}-{SCOOP_MAX_S:.0f} s")
-                    if result['speed_min'] < SPEED_MIN_MS or result['speed_max'] > SPEED_MAX_MS:
-                        problems.append(f"hız {result['speed_min']:.1f}-{result['speed_max']:.1f} m/s, şart {SPEED_MIN_MS}-{SPEED_MAX_MS} m/s")
+                    speed_ok, why = SA.hiz_kabul(result['out_of_abort_s'], siniri)
+                    if not speed_ok:
+                        problems.append(why)
                 result.update(ok=not problems, reason='; '.join(problems) or None)
                 break
             if contact_start is not None and speed < 5.0 and sim - contact_start > 30.0:
@@ -639,7 +662,7 @@ def run_water_leg_px4(vehicle, home, model, timeout=720.0, log=print):
     log(f"PX4 su alma: su {info['water_height']:.3f} m, yön {info['run_course']:.0f}°, hat {info['run_start'][0]:.4f},{info['run_start'][1]:.4f}"
         f" → {info['end'][0]:.4f},{info['end'][1]:.4f}, hedef {ayar.hedef_hiz_ms:g} m/s {ayar.sure_s:g} s")
     result = dict(ok=False, reason='zaman aşımı', contact_s=0.0, scoop_s=None, speed_min=None, speed_max=None, entered_speed=None,
-                  decel_s=None, liftoff_s=None, liftoff_speed=None, out_of_band_s=0.0, lowest=None, max_roll=0.0, wheel_z=None,
+                  decel_s=None, liftoff_s=None, liftoff_speed=None, out_of_band_s=0.0, out_of_abort_s=0.0, lowest=None, max_roll=0.0, wheel_z=None,
                   water_height=info['water_height'], climb_end=info['climb_end'], tank_kg=None, attempts=0,
                   px4_phases=[], px4_report=None, px4_report_ok=None, aborts=[])
 
@@ -663,6 +686,10 @@ def run_water_leg_px4(vehicle, home, model, timeout=720.0, log=print):
         return finish(f'iniş takımı toplu değil (tekerlek z {wheel:.3f}); su bölümü başlatılmadı')
     if read_param(vehicle, PX4_SCOOP_PARAM) is None:
         return finish(f'PX4 {PX4_SCOOP_PARAM.decode()} yok: bu PX4 ikilisinde su alma yok; su bölümü başlatılmadı')
+    try:
+        siniri = hiz_siniri(vehicle)
+    except RuntimeError as error:
+        return finish(f'{error}; su bölümü başlatılmadı')
     throttle = read_param(vehicle, THROTTLE_PARAM)
     if throttle is None or abs(throttle - THROTTLE_EXPECTED_ORIGINAL) > 1e-3:
         return finish(f'FW_THR_MAX {throttle}, beklenen {THROTTLE_EXPECTED_ORIGINAL:.3f}; su bölümü başlatılmadı')
@@ -729,7 +756,7 @@ def run_water_leg_px4(vehicle, home, model, timeout=720.0, log=print):
                     if value.asama == 'KALKIS' and m['kalkis'] is None:
                         m['kalkis'] = telemetry.snapshot()[0]
                     elif value.asama == 'BITTI':
-                        ok, why = SA.bitti_kabul(value, ayar)
+                        ok, why = SA.bitti_kabul(value, siniri, ayar)
                         result.update(px4_report=value.degerler, px4_report_ok=ok)
                         log(f'PX4 raporu: {why}')
                     elif value.iptal and pending is None:
@@ -790,15 +817,18 @@ def run_water_leg_px4(vehicle, home, model, timeout=720.0, log=print):
                 result['max_roll'] = max(result['max_roll'], abs(math.degrees(roll)))
                 # Pencere: suda ilk bant içi ölçümden PX4 KALKIS'a kadar (dolum PX4 hız bandında; kabul bandı ayrı)
                 if m['kalkis'] is None:
-                    if m['window'] is None and ayar.bant_alt_ms <= speed <= ayar.bant_ust_ms:
+                    if m['window'] is None and ayar.bant_alt_ms <= speed <= siniri.kontrol_ust_ms:
                         m['window'] = sim
                         result.update(decel_s=sim - m['contact'], speed_min=speed, speed_max=speed)
                         log(f'su alma penceresi başladı: değmeden {result["decel_s"]:.1f} s, hız {speed:.1f} m/s')
                     elif m['window'] is not None:
                         result['speed_min'] = min(result['speed_min'], speed)
                         result['speed_max'] = max(result['speed_max'], speed)
-                        if not ayar.bant_alt_ms <= speed <= ayar.bant_ust_ms and m['window_last'] is not None:
-                            result['out_of_band_s'] += sim - m['window_last']
+                        if m['window_last'] is not None:
+                            if not ayar.bant_alt_ms <= speed <= siniri.kontrol_ust_ms:
+                                result['out_of_band_s'] += sim - m['window_last']
+                            if not siniri.iptal_alt_ms <= speed <= siniri.iptal_ust_ms:
+                                result['out_of_abort_s'] += sim - m['window_last']
                     m['window_last'] = sim if m['window'] is not None else None
             elif m['contact'] is not None and not m['left'] and clear is not None:
                 m['left'], m['last_contact'] = True, None
@@ -838,8 +868,9 @@ def run_water_leg_px4(vehicle, home, model, timeout=720.0, log=print):
                 else:
                     if not ayar.sure_min_s <= result['scoop_s'] <= ayar.sure_max_s:
                         problems.append(f"pencere {result['scoop_s']:.1f} s, şart {ayar.sure_min_s:.0f}-{ayar.sure_max_s:.0f} s")
-                    if result['speed_min'] < ayar.bant_alt_ms or result['speed_max'] > ayar.bant_ust_ms:
-                        problems.append(f"hız {result['speed_min']:.1f}-{result['speed_max']:.1f} m/s, şart {ayar.bant_alt_ms}-{ayar.bant_ust_ms} m/s")
+                    speed_ok, why = SA.hiz_kabul(result['out_of_abort_s'], siniri)
+                    if not speed_ok:
+                        problems.append(why)
                 if tank is not None:
                     w = tank.read()
                     result['tank_kg'] = None if w is None else w - (tank_start or 0.0)

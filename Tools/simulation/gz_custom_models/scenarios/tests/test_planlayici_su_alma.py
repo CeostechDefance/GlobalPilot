@@ -2,10 +2,13 @@
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from otonom.planlayici import su_alma as SA  # noqa: E402
 
 A = SA.SuAlmaAyar()
+S = SA.HizSiniri(19.44, 34.72, 3.0, 27.5)   # PX4 varsayılanları: FW_SC_A_VMIN, FW_SC_A_VMAX, FW_SC_OOB_T, FW_SC_VMAX
 
 
 def maddeler():
@@ -75,14 +78,26 @@ def test_izleyici_kurallari():
     assert SA.izleyici_iptal('SUALMA', 5.0, 0.4, None) is None   # su bilinmiyorsa iptal yok
 
 
-def test_bitti_kabul_olcutu_gevsetilmez():
-    ok = SA.statustext_coz('SU: BITTI sure=10.1 vmin=22.6 vmax=24.8 bant_disi=0.0')
-    assert SA.bitti_kabul(ok)[0]
-    assert not SA.bitti_kabul(SA.statustext_coz('SU: BITTI sure=7.9 vmin=22.6 vmax=24.8 bant_disi=0'))[0]
-    assert not SA.bitti_kabul(SA.statustext_coz('SU: BITTI sure=10 vmin=22.2 vmax=24.8 bant_disi=0'))[0]
-    assert not SA.bitti_kabul(SA.statustext_coz('SU: BITTI sure=10 vmin=22.6 vmax=27.8 bant_disi=0'))[0]
-    assert not SA.bitti_kabul(SA.statustext_coz('SU: BITTI sure=10 vmin=22.6 vmax=24.8 bant_disi=0.4'))[0]
-    assert not SA.bitti_kabul(SA.statustext_coz('SU: BITTI sure=10'))[0]
+def test_bitti_kabul_px4_sinirlari():
+    """Hız sınırları PX4 parametrelerinden (kullanıcı 2026-11-27): süre 8-12 s, iptal bandı dışında en çok FW_SC_OOB_T."""
+    assert SA.bitti_kabul(SA.statustext_coz('SU: BITTI sure=10.1 vmin=22.6 vmax=24.8 bant_disi=0.0 iptal_disi=0'), S)[0]
+    # 80 km/h altı ama iptal bandı (70-125 km/h) içinde: 2026-11-27 test uçuşları (22,06 ve 20,6 m/s) artık başarılı
+    assert SA.bitti_kabul(SA.statustext_coz('SU: BITTI t=10 v=20.6-23.7 d=1.4 a=0'), S)[0]
+    assert not SA.bitti_kabul(SA.statustext_coz('SU: BITTI sure=7.9 vmin=22.6 vmax=24.8 iptal_disi=0'), S)[0]
+    assert not SA.bitti_kabul(SA.statustext_coz('SU: BITTI t=10 v=18.0-24.8 d=4 a=3.2'), S)[0]
+    assert SA.bitti_kabul(SA.statustext_coz('SU: BITTI t=10 v=18.0-24.8 d=2 a=2.9'), S)[0]
+    assert not SA.bitti_kabul(SA.statustext_coz('SU: BITTI sure=10'), S)[0]
+    # Sınırlar parametre olduğu için eski katı kural da PX4'ten kurulabilir (FW_SC_A_VMIN 22,22, FW_SC_OOB_T 0)
+    strict = SA.HizSiniri(80 / 3.6, 100 / 3.6, 0.0, 27.5)
+    assert not SA.bitti_kabul(SA.statustext_coz('SU: BITTI t=10 v=22.0-24.8 d=0.6 a=0.6'), strict)[0]
+
+
+def test_hiz_siniri_px4_okunur():
+    values = dict(FW_SC_A_VMIN=19.44, FW_SC_A_VMAX=34.72, FW_SC_OOB_T=3.0, FW_SC_VMAX=27.5)
+    assert SA.hiz_siniri_px4(values.get) == S
+    with pytest.raises(RuntimeError):
+        SA.hiz_siniri_px4(lambda name: None if name == 'FW_SC_OOB_T' else values[name])
+    assert SA.hiz_kabul(3.0, S)[0] and not SA.hiz_kabul(3.01, S)[0]
 
 
 def test_iptal_tamam_yeni_iptal_degil():
@@ -93,21 +108,23 @@ def test_iptal_tamam_yeni_iptal_degil():
 
 
 def test_kalkis_raporu_degerleri():
-    k = SA.statustext_coz('SU: KALKIS sure=10.0 vmin=23.1 vmax=25.9 bant_disi=0.0')
-    assert k.asama == 'KALKIS' and SA.bitti_kabul(k)[0]
+    k = SA.statustext_coz('SU: KALKIS sure=10.0 vmin=23.1 vmax=25.9 bant_disi=0.0 iptal_disi=0.0')
+    assert k.asama == 'KALKIS' and SA.bitti_kabul(k, S)[0]
 
 
 def test_kesik_rapor_kabul_sayilmaz():
     k = SA.statustext_coz('SU: KALKIS sure=10.0 vmin=24.9 vmax=27.5 bant_disi')
-    assert not SA.bitti_kabul(k)[0]
-    assert not SA.bitti_kabul(SA.statustext_coz('SU: BITTI sure=10 vmin=23 vmax=25 bant_disi=0 kabul=0'))[0]
+    assert not SA.bitti_kabul(k, S)[0]
+    assert not SA.bitti_kabul(SA.statustext_coz('SU: BITTI t=10 v=23-25 d=0 a'), S)[0]
 
 
 def test_kisa_bicim():
     b = SA.statustext_coz('SU: BITTI t=10.0 v=22.1-25.1 d=0.6 k=0')
     assert b.degerler == dict(sure=10.0, vmin=22.1, vmax=25.1, bant_disi=0.6, kabul=0.0)
-    assert not SA.bitti_kabul(b)[0]
-    assert SA.bitti_kabul(SA.statustext_coz('SU: KALKIS t=10.2 v=22.9-25.8 d=0 k=1'))[0]
+    assert not SA.bitti_kabul(b, S)[0]                      # iptal bandı dışı süre (a) yok: kesik rapor
+    a = SA.statustext_coz('SU: BITTI t=10.0 v=22.1-25.1 d=0.6 a=0.0 k=1')
+    assert a.degerler['iptal_disi'] == 0.0 and SA.bitti_kabul(a, S)[0]
+    assert SA.bitti_kabul(SA.statustext_coz('SU: KALKIS t=10.2 v=22.9-25.8 d=0 a=0 k=1'), S)[0]
     d = SA.statustext_coz('SU: DEGME v=24.5 p=1.4 vz=0.37')
     assert d.degerler == dict(hiz=24.5, burun=1.4, vz=0.37)
     i = SA.statustext_coz('SU: IPTAL BANT t=2.7 v=20.8-27.5 d=3.1')

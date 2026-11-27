@@ -11,8 +11,11 @@ Arayüz v1 (globalpilot-6b ile, 2026-11-11):
 - İptal: MAV_CMD_DO_GO_AROUND; PX4 su + FW_SC_GA_ALT'a düz tırmanır, AUTO.LOITER'da bekler, görev ilerlemez.
   Karar burada: yeniden deneme (MISSION_SET_CURRENT yaklaşma + AUTO.MISSION) ya da bırakma.
 
-Kabul ölçütü değişmez (kullanıcı): suda 8-12 s, 22,22-27,78 m/s. Değerlendirme Gazebo ölçümüyle yapılır (water_leg);
-PX4'ün BITTI raporu yalnız karşılaştırma için kaydedilir.
+Kabul ölçütü: suda 8-12 s. Hız sınırları PX4 parametrelerinden (kullanıcı 2026-11-27: "sınırlar px4 parametre
+kısmından alınsın"), PX4'ün kendi su alma kuralıyla aynı: gaz kontrol bandını (param4 .. FW_SC_VMAX, 80 km/h-27,5 m/s)
+hedefler; su alma ancak iptal bandının (FW_SC_A_VMIN .. FW_SC_A_VMAX) dışında toplam FW_SC_OOB_T'den uzun kalınırsa
+başarısız sayılır (önceden sabit 22,22-27,78 m/s ve bant dışı süre sıfır). Değerlendirme Gazebo ölçümüyle yapılır
+(water_leg); PX4'ün BITTI raporu yalnız karşılaştırma için kaydedilir.
 
 Simülasyon ya da MAVLink bağlantısı bilmez: girdi metin ve sayılar, çıktı görev maddesi (dict) ve karar.
 """
@@ -21,7 +24,8 @@ import re
 from dataclasses import dataclass, field
 
 __all__ = ['MAV_CMD_USER_1', 'MAV_CMD_DO_GO_AROUND', 'ASAMALAR', 'SuAlmaAyar', 'SuMesaji', 'su_alma_maddeleri',
-           'su_alma_kapat', 'statustext_coz', 'asama_adi', 'iptal_karari', 'izleyici_iptal', 'bitti_kabul']
+           'su_alma_kapat', 'statustext_coz', 'asama_adi', 'iptal_karari', 'izleyici_iptal', 'bitti_kabul',
+           'HizSiniri', 'KABUL_PARAMS', 'hiz_siniri_px4', 'hiz_kabul']
 
 MAV_CMD_USER_1 = 31010
 MAV_CMD_DO_GO_AROUND = 191
@@ -42,8 +46,7 @@ YENIDEN_DENENIR = ('KAPI', 'HIZ_DUSUK', 'YATIS', 'YAN_SAPMA', 'BANT')
 class SuAlmaAyar:
     hedef_hiz_ms: float = 25.0
     sure_s: float = 10.0
-    bant_alt_ms: float = 80 / 3.6           # kabul alt sınırı, yuvarlatmadan
-    bant_ust_ms: float = 100 / 3.6          # kabul üst sınırı; PX4 dolumu FW_SC_VMAX (27,5) üstünde durdurur
+    bant_alt_ms: float = 80 / 3.6           # kontrol bandı alt sınırı (görev maddesi param4); üstü PX4 FW_SC_VMAX
     sure_min_s: float = 8.0
     sure_max_s: float = 12.0
     deneme_en_cok: int = 3                  # bugünkü offboard hizalanma ile aynı
@@ -53,6 +56,35 @@ class SuAlmaAyar:
     su_onde_m: float = 300.0                # su aşamalarında uçağın bu kadar önü su olmalı
     telemetri_en_cok_s: float = 2.5         # SU_ASAMA 2 Hz; bundan uzun sessizlik su aşamasında iptal
     sualma_pay_s: float = 6.0               # SUALMA süre + bu kadar içinde KALKIS gelmezse iptal
+
+
+KABUL_PARAMS = ('FW_SC_A_VMIN', 'FW_SC_A_VMAX', 'FW_SC_OOB_T', 'FW_SC_VMAX')
+
+
+@dataclass(frozen=True)
+class HizSiniri:
+    """Su almanın hız sınırları, PX4 parametrelerinden (hiz_siniri_px4)."""
+    iptal_alt_ms: float                     # FW_SC_A_VMIN: iptal bandı alt sınırı
+    iptal_ust_ms: float                     # FW_SC_A_VMAX: iptal bandı üst sınırı
+    disarida_en_cok_s: float                # FW_SC_OOB_T: iptal bandı dışında en çok bu kadar (toplam)
+    kontrol_ust_ms: float                   # FW_SC_VMAX: kontrol bandı üstü; dolum ve pencere bunun altında
+
+
+def hiz_siniri_px4(read_param):
+    """read_param(ad) -> değer ya da None. Okunamayan parametre varsa RuntimeError: kabul sessizce varsayılana düşmesin."""
+    values = {name: read_param(name) for name in KABUL_PARAMS}
+    missing = [name for name, value in values.items() if value is None]
+    if missing:
+        raise RuntimeError(f'su alma sınırları PX4\'ten okunamadı: {", ".join(missing)}')
+    return HizSiniri(*(float(values[name]) for name in KABUL_PARAMS))
+
+
+def hiz_kabul(disarida_s, siniri):
+    """İptal bandı dışında geçen toplam süre (s) kabul ediliyor mu: (bool, gerekçe ya da None). PX4'ün iptal kuralıyla aynı."""
+    if disarida_s > siniri.disarida_en_cok_s:
+        return False, (f'hız {siniri.iptal_alt_ms:.2f}-{siniri.iptal_ust_ms:.2f} m/s dışında {disarida_s:.1f} s, '
+                       f'en çok {siniri.disarida_en_cok_s:.1f} s (PX4 FW_SC_OOB_T)')
+    return True, None
 
 
 @dataclass
@@ -90,8 +122,8 @@ def su_alma_kapat(water_amsl):
 _SAYI = re.compile(r'(\w+)=(-?\d+(?:\.\d+)?)')
 _ARALIK = re.compile(r'\b(v)=(-?\d+(?:\.\d+)?--?\d+(?:\.\d+)?)')
 # PX4 kısa biçimi (STATUSTEXT 50 karakter, ee 2026-11-12): t bant içi süre, v en düşük-en yüksek hız, d bant dışı s,
-# k kabul, p burun, vz alçalma. Uzun anahtarlar da kabul edilir.
-_KISA = {'t': 'sure', 'd': 'bant_disi', 'k': 'kabul', 'p': 'burun', 'v': 'hiz'}
+# a iptal bandı dışı s, k kabul, p burun, vz alçalma. Uzun anahtarlar da kabul edilir.
+_KISA = {'t': 'sure', 'd': 'bant_disi', 'a': 'iptal_disi', 'k': 'kabul', 'p': 'burun', 'v': 'hiz'}
 
 
 def statustext_coz(text):
@@ -158,8 +190,9 @@ def izleyici_iptal(asama, asama_suresi_s, telemetri_yasi_s, su_onde, ayar=SuAlma
     return None
 
 
-def bitti_kabul(mesaj, ayar=SuAlmaAyar()):
-    """PX4 BITTI raporu kabul ölçütünü tutuyor mu: (bool, açıklama). Karşılaştırma içindir; asıl karar Gazebo ölçümü."""
+def bitti_kabul(mesaj, siniri, ayar=SuAlmaAyar()):
+    """PX4 BITTI raporu kabul ölçütünü tutuyor mu: (bool, açıklama). Karşılaştırma içindir; asıl karar Gazebo ölçümü.
+    siniri: HizSiniri (PX4 parametreleri). Süre sure_min_s-sure_max_s, iptal bandı dışı süre (a) en çok FW_SC_OOB_T."""
     d = mesaj.degerler
     eksik = [k for k in ('sure', 'vmin', 'vmax') if k not in d]
     if eksik:
@@ -167,12 +200,10 @@ def bitti_kabul(mesaj, ayar=SuAlmaAyar()):
     sorun = []
     if not ayar.sure_min_s <= d['sure'] <= ayar.sure_max_s:
         sorun.append(f"süre {d['sure']:.1f} s")
-    if d['vmin'] < ayar.bant_alt_ms or d['vmax'] > ayar.bant_ust_ms:
-        sorun.append(f"hız {d['vmin']:.1f}-{d['vmax']:.1f} m/s")
-    if 'bant_disi' not in d:
-        sorun.append('bant dışı süre raporda yok (STATUSTEXT 50 karakterde kesilmiş olabilir)')
-    elif d['bant_disi'] > 0.0:
-        sorun.append(f"bant dışı {d['bant_disi']:.1f} s")
-    if d.get('kabul', 1.0) != 1.0:
-        sorun.append('PX4 kabul=0')
+    if 'iptal_disi' not in d:
+        sorun.append('iptal bandı dışı süre raporda yok (STATUSTEXT 50 karakterde kesilmiş olabilir)')
+    else:
+        ok, why = hiz_kabul(d['iptal_disi'], siniri)
+        if not ok:
+            sorun.append(why)
     return not sorun, '; '.join(sorun) or 'kabul'

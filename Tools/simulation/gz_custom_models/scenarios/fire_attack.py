@@ -30,7 +30,7 @@ from pymavlink import mavutil
 
 from fire_locator import find_fire, pixel_to_ned, ray_to_ground
 from place_wildfire import data_root_dir, ground_height  # fire_locator adds its folder to the path
-from otonom.planlayici import rota as R, su_gecisi as SG, pist as PL, birakma as PB  # noqa: E402  plan kuralları planlayıcıda (kullanıcı 2026-11-10)
+from otonom.planlayici import rota as R, su_gecisi as SG, pist as PL, birakma as PB, su_alma as SA  # noqa: E402  plan kuralları planlayıcıda (kullanıcı 2026-11-10)
 
 M = mavutil.mavlink
 # Per world: runway heading, where the search goes, and the fire's true position (only for scoring the drop).
@@ -719,6 +719,16 @@ def main():
     if abs(throttle_limit - THROTTLE_LIMIT_EXPECTED) > 1e-3:
         sys.exit(f'{THROTTLE_LIMIT_PARAM}={throttle_limit:.3f}, beklenen {THROTTLE_LIMIT_EXPECTED}. Arm edilmedi. Parametre dosyasını kontrol edin.')
     print(f'{THROTTLE_LIMIT_PARAM}={throttle_limit:.3f}', flush=True)
+    if args.scoop:
+        # Su alma hız sınırları PX4 parametrelerinden (kullanıcı 2026-11-27); havada okumak telemetriyi bekletir, yerde okunur
+        try:
+            water_leg.HIZ_SINIRI = SA.hiz_siniri_px4(lambda name: read_param(v, name))
+        except RuntimeError as error:
+            sys.exit(f'{error}. Arm edilmedi.')
+        lim = water_leg.HIZ_SINIRI
+        print(f'Su alma hız sınırları (PX4): gaz hedefi {water_leg.SPEED_MIN_MS:.2f}-{lim.kontrol_ust_ms:.2f} m/s, '
+              f'başarısız: {lim.iptal_alt_ms:.2f}-{lim.iptal_ust_ms:.2f} m/s ({lim.iptal_alt_ms * 3.6:.0f}-{lim.iptal_ust_ms * 3.6:.0f} km/h) '
+              f'dışında toplam {lim.disarida_en_cok_s:.1f} s\'den uzun', flush=True)
     # The actual weight from the start: globalpilot-49's takeoff tests (2026-11-08) showed the takeoff at 800 kg without
     # the sag after the takeoff step (PX4 also scales the takeoff speeds: 38.6 m/s, liftoff in 305-317 m).
     from otonom.sensor import SimTankKutlesi
