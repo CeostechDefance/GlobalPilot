@@ -155,9 +155,10 @@ class Hizalanma:
                         self.log(f'SUYA DEĞDİ: {self.touch}')
                     elif now - wet_since >= self.p.touch_stable_s:
                         if self.p.handover_throttle_param and self.p.handover_throttle is not None:
+                            # Geri okuma yalnız kayıt içindi ve offboard döngüsünü 1 s'ye kadar bekletiyordu (bekçi 0,3 s'de
+                            # güvenli komuta geçer); değer su bölümünün sonunda geri alınırken okunarak doğrulanır
                             self.b.set_param(self.p.handover_throttle_param, self.p.handover_throttle)
-                            got = self.b.read_param(self.p.handover_throttle_param, timeout=1.0)
-                            self.k.karar(f'devir öncesi {self.p.handover_throttle_param} {self.p.handover_throttle:g}, okunan {got}')
+                            self.k.karar(f'devir öncesi {self.p.handover_throttle_param} {self.p.handover_throttle:g}')
                         self.b.set_current(self.p.handover_seq)
                         ok = o.exit_to(PX4_MAIN_AUTO, PX4_AUTO_MISSION)
                         self.k.karar(f'DEVİR: Geçiş sonu (adım {self.p.handover_seq}), AUTO.MISSION {ok}')

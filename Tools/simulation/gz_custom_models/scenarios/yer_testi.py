@@ -54,15 +54,12 @@ class Arac:
             deger, zaman_asimi = 0.0, 0.0
         self.link.mav.command_long_send(self.link.target_system, self.link.target_component, MAV_CMD_ACTUATOR_TEST, 0,
                                         deger, zaman_asimi, 0, 0, islev + 1000, 0, 0)
-        return True
 
     def tut(self, islev, deger, sure):
         bitis = time.time() + sure
         while time.time() < bitis:
-            if not self.test(islev, deger, min(3.0, bitis - time.time() + 0.3)):
-                return False
+            self.test(islev, deger, min(3.0, bitis - time.time() + 0.3))
             self.oku(min(1.0, max(bitis - time.time(), 0.0)))
-        return True
 
 
 def yavas(arac, islev, a, b, sure):

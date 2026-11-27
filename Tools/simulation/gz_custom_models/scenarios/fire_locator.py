@@ -30,6 +30,8 @@ def find_fire_box(rgb):
     r, g, b = (rgb[..., i].astype(np.int16) for i in range(3))
     # Flames have far less blue than the bright red soil in the imagery: blue under 100 against over 100 there.
     flame = (r > 205) & (b < 105) & (g - b > 55) & (r - g > 55)
+    if not flame.any():   # aramada karelerin çoğu: duman maskesi ve etiketleme boşuna olmasın
+        return None
     smoke = (r < 80) & (g < 80) & (b < 80) & (np.abs(r - g) < 10) & (np.abs(g - b) < 10)
     labels, count = ndimage.label(ndimage.binary_dilation(flame, iterations=4))
     best = None
@@ -75,7 +77,6 @@ def ray_to_ground(lat, lon, alt_amsl, ray, region='antalya', data_root=None):
         return None
     root = data_root or data_root_dir()
     cos_lat = math.cos(math.radians(lat))
-    previous = 0.0
     s = RAY_STEP_M
     while s < RAY_MAX_M:
         la = lat + ray[0] * s / 111320.0
@@ -85,9 +86,7 @@ def ray_to_ground(lat, lon, alt_amsl, ray, region='antalya', data_root=None):
             ground = ground_height(root, region, la, lo)
         except (OSError, SystemExit):
             return None
-        if z <= ground:
-            # one bisection pass is enough at this step size
+        if z <= ground:   # first step under the terrain (RAY_STEP_M resolution, no refinement)
             return la, lo, ground, s
-        previous = s
         s += RAY_STEP_M
     return None

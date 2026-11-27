@@ -38,7 +38,6 @@ class Offboard:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name='offboard-gonderim', daemon=True)
         self.watchdog = None        # None, 'güvenli', 'çıkış'
-        self.watchdog_events = []
         self._exiting = False       # çıkış sırasında son komut yinelenir, bekçi kipi değiştirmez
 
     def set(self, roll_deg, pitch_deg, thrust):
@@ -103,7 +102,6 @@ class Offboard:
     def _event(self, kind, age):
         if kind != self.watchdog:
             self.watchdog = kind
-            self.watchdog_events.append((time.time(), kind, round(age, 2)))
             self.log(f'bekçi: {kind or "normal"} (komut yaşı {age:.2f} s)')
 
     def _send(self, roll_deg, pitch_deg, thrust):

@@ -1,8 +1,8 @@
 """MAVLink bağlantısı: tek okuma iş parçacığı, kilitli durum, gönderimler tek kilitten.
 
-Bu nesne çalışırken bağlantıdan başka hiçbir yer recv_match çağırmaz. Görev yükleme ve parametre okuma da yanıtları
-okuma iş parçacığının kuyruğundan alır. fire_attack.Vehicle ve water_leg.StandaloneVehicle ile aynı arayüzü sunar
-(state, update, upload, command, link), böylece run_water_leg değişmeden kullanabilir.
+Bu nesne çalışırken bağlantıdan başka hiçbir yer recv_match çağırmaz. Parametre okuma yanıtları okuma iş parçacığının
+kuyruğundan alır. Su bölümünde offboard hizalanma (otonom.hizalanma) ve PX4 içi su alma
+(water_leg.run_water_leg_px4) kullanır: durum, parametre, görev adımı ve kip.
 """
 import math
 import queue
@@ -17,7 +17,7 @@ PX4_AUTO_LOITER, PX4_AUTO_MISSION = 3, 4
 
 
 class Baglanti:
-    REPLY_TYPES = ('MISSION_REQUEST_INT', 'MISSION_REQUEST', 'MISSION_ACK', 'PARAM_VALUE', 'COMMAND_ACK')
+    REPLY_TYPES = ('PARAM_VALUE',)
 
     def __init__(self, link, log=print, statustext=True, dinleyici=None):
         self.link = link
@@ -96,17 +96,13 @@ class Baglanti:
     # --- durum
     @property
     def state(self):
-        """Anlık kopya. (Eski arayüz state[...] okur; yazmaz.)"""
+        """Anlık kopya; değiştirmek iç durumu etkilemez."""
         with self._lock:
             return dict(self._state)
 
     def main_mode(self):
         mode = self.state['mode']
         return (mode >> 16) & 0xFF, (mode >> 24) & 0xFF
-
-    def update(self, seconds):
-        """Eski arayüz: okuma iş parçacığı zaten okuyor, burada yalnız beklenir."""
-        time.sleep(max(seconds, 0.0))
 
     # --- gönderim (tek kilit)
     def send(self, fn):
@@ -141,13 +137,6 @@ class Baglanti:
                 return msg
         return None
 
-    def _drain(self):
-        while True:
-            try:
-                self._replies.get_nowait()
-            except queue.Empty:
-                return
-
     def read_param(self, name, timeout=3.0):
         """PARAM_VALUE değeri ya da None. name bytes ya da str."""
         text = name.decode() if isinstance(name, bytes) else name
@@ -160,29 +149,6 @@ class Baglanti:
         text = name.decode() if isinstance(name, bytes) else name
         self.send(lambda mav: mav.param_set_send(self.link.target_system, self.link.target_component, text.encode(),
                                                  float(value), M.MAV_PARAM_TYPE_REAL32))
-
-    def upload(self, items, timeout=20.0):
-        """Görev yükler. Kabul edilmezse RuntimeError.
-        item: dict(cmd, lat, lon, alt (eve göre), radius -> param2 (LOITER_TO_ALT: eksi = saat tersi),
-                   param1, param3, param4 (LOITER_TO_ALT: 1 = teğet çıkış), frame); verilmeyenler PX4 varsayılanı."""
-        self._drain()
-        self.send(lambda mav: mav.mission_count_send(self.link.target_system, self.link.target_component, len(items), 0))
-        end = time.time() + timeout
-        while time.time() < end:
-            msg = self._wait_reply(lambda m: m.get_type() in ('MISSION_REQUEST_INT', 'MISSION_REQUEST', 'MISSION_ACK'),
-                                   end - time.time())
-            if msg is None:
-                break
-            if msg.get_type() == 'MISSION_ACK':
-                if msg.type != M.MAV_MISSION_ACCEPTED:
-                    raise RuntimeError(f'görev reddedildi (kod {msg.type})')
-                return
-            item = items[msg.seq]
-            self.send(lambda mav, s=msg.seq, it=item: mav.mission_item_int_send(
-                self.link.target_system, self.link.target_component, s, it.get('frame', M.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT),
-                it['cmd'], int(s == 0), 1, it.get('param1', 0), it.get('radius', 0), it.get('param3', 0), it.get('param4', float('nan')),
-                int(it['lat'] * 1e7), int(it['lon'] * 1e7), it['alt'], 0))
-        raise RuntimeError('görev yüklenemedi: PX4 yanıt vermedi')
 
     def set_current(self, seq):
         self.send(lambda mav: mav.mission_set_current_send(self.link.target_system, self.link.target_component, seq))

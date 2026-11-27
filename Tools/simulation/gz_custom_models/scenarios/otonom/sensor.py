@@ -52,11 +52,3 @@ class SimTankKutlesi(KutleKaynagi):
             if self._water is None or time.time() - self._time > max_age_s:
                 return None
             return self.empty + self._water
-
-
-class SabitKutle(KutleKaynagi):
-    def __init__(self, mass_kg):
-        self.mass = mass_kg
-
-    def read(self):
-        return self.mass
