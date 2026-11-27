@@ -362,20 +362,20 @@ private:
 		hrt_abstime start_time{0}; // [us]
 		float initial_height_rate_setpoint{0.0f}; // [m/s]
 		float start_height{0.0f}; // [m] height above the touchdown point when the flare started
-		float start_pitch{0.0f}; // [rad] pitch angle when the flare started (flare law 3)
-		float sink_rate_integral{0.0f}; // [rad] integral term of the flare law 3 pitch command
-		float throttle_integral{0.0f}; // [-] integral term of the flare law 4 throttle command
+		float start_pitch{0.0f}; // [rad] pitch angle when the flare started, centre of the sink rate pitch PI (laws 3-6)
+		float sink_rate_integral{0.0f}; // [rad] integral term of the sink rate pitch PI (laws 3-6)
+		float throttle_integral{0.0f}; // [-] integral term of the flare throttle PI (laws 4-6, scoop)
 		float attitude_offset{0.0f}; // [rad] flare law 4 landing attitude reduction by the airspeed guard (<= 0)
 		bool attitude_hold{false}; // flare law 4: false = decelerating (pitch holds the sink rate, idle throttle)
 		float hold_pitch{0.0f}; // [rad] flare law 4 pitch command, rate limited towards the landing attitude
-		float throttle_cmd{0.0f}; // [-] flare law 4 throttle command, slew rate limited
+		float throttle_cmd{0.0f}; // [-] flare throttle command, slew rate limited (laws 4-6, scoop)
 		float throttle_start{0.0f}; // [-] flare law 6 throttle at flare start (centre of the airspeed PI)
 		float start_airspeed{0.0f}; // [m/s] flare law 6 airspeed at flare start
 		float pitch_cmd{0.0f}; // [rad] flare law 6 rate limited pitch command
 		bool touchdown{false}; // flare law 6: touchdown latched (sink rate collapsed near the ground)
 		float touchdown_timer{0.0f}; // [s] flare law 6 time the touchdown condition has held
 		float last_range{NAN}; // [m] flare law 6 last valid range finder reading (water: hull under the radar)
-		hrt_abstime last_update{0}; // [us] last flare law 4 update
+		hrt_abstime last_update{0}; // [us] last flare update
 	} _flare_states;
 
 	// Flare law 6 step (shared by the runway landing and the water scoop: same algorithm, surface profile)
@@ -395,7 +395,7 @@ private:
 		bool touched_down;
 	};
 
-	void law6Start(FlareStates &fs, const hrt_abstime now, const float height);
+	void flareStart(FlareStates &fs, const hrt_abstime now, const float height);
 	Law6Output law6Step(FlareStates &fs, const hrt_abstime now, const float height, const Law6Profile &profile);
 
 	// GASI water scoop (mission item MAV_CMD_USER_1 + two waypoints at the water surface): approach on a glide slope,
@@ -444,8 +444,14 @@ private:
 	void setScoopPhase(const hrt_abstime now, ScoopPhase phase, const char *detail = nullptr);
 	void scoopAbort(const hrt_abstime now, const char *reason);
 	bool scoopEngage(const position_setpoint_s &pos_sp_prev, const position_setpoint_s &pos_sp_curr);
-	void control_auto_scoop(const hrt_abstime &now, const float control_interval, const Vector2f &ground_speed,
-				const position_setpoint_s &pos_sp_curr);
+	void control_auto_scoop(const hrt_abstime &now, const Vector2f &ground_speed, const position_setpoint_s &pos_sp_curr);
+	void publishScoopPhase(const hrt_abstime now);
+	void publishCommandAck(const vehicle_command_s &cmd, const uint8_t result);
+
+	// WEIGHT_GROSS / WEIGHT_BASE (1 when either is unset); flare laws scale airspeeds and throttle with it
+	float weightRatio() const;
+
+	static constexpr uint32_t VEHICLE_CMD_SCOOP{31010};   // MAV_CMD_USER_1 water scoop (navigator: NAV_CMD_USER_1)
 
 	// [m] last terrain estimate which was valid
 	float _last_valid_terrain_alt_estimate{0.0f};

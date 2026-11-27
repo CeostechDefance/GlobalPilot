@@ -147,15 +147,10 @@ FixedWingModeManager::vehicle_command_poll()
 			}
 
 			// commander leaves DO_GO_AROUND unacknowledged: answer here so the planner knows it arrived
-			vehicle_command_ack_s ack{};
-			ack.command = vehicle_command.command;
-			ack.result = accepted ? vehicle_command_ack_s::VEHICLE_CMD_RESULT_ACCEPTED : vehicle_command_ack_s::VEHICLE_CMD_RESULT_DENIED;
-			ack.target_system = vehicle_command.source_system;
-			ack.target_component = vehicle_command.source_component;
-			ack.timestamp = hrt_absolute_time();
-			_vehicle_command_ack_pub.publish(ack);
+			publishCommandAck(vehicle_command, accepted ? vehicle_command_ack_s::VEHICLE_CMD_RESULT_ACCEPTED
+					  : vehicle_command_ack_s::VEHICLE_CMD_RESULT_DENIED);
 
-		} else if (vehicle_command.command == 31010) {
+		} else if (vehicle_command.command == VEHICLE_CMD_SCOOP) {
 			// MAV_CMD_USER_1 water scoop (mission item or COMMAND_LONG): param1 1 arm / 0 disarm, param2 airspeed, param3
 			// duration, param4 lower band limit, param7 water surface AMSL
 			if (vehicle_command.param1 > 0.5f && PX4_ISFINITE(vehicle_command.param7)) {
@@ -178,13 +173,7 @@ FixedWingModeManager::vehicle_command_poll()
 				mavlink_log_info(&_mavlink_log_pub, "SU: KAPATILDI\t");
 			}
 
-			vehicle_command_ack_s ack{};
-			ack.command = vehicle_command.command;
-			ack.result = vehicle_command_ack_s::VEHICLE_CMD_RESULT_ACCEPTED;
-			ack.target_system = vehicle_command.source_system;
-			ack.target_component = vehicle_command.source_component;
-			ack.timestamp = hrt_absolute_time();
-			_vehicle_command_ack_pub.publish(ack);
+			publishCommandAck(vehicle_command, vehicle_command_ack_s::VEHICLE_CMD_RESULT_ACCEPTED);
 
 		} else if (vehicle_command.command == vehicle_command_s::VEHICLE_CMD_DO_CHANGE_SPEED) {
 
@@ -1482,8 +1471,10 @@ FixedWingModeManager::control_auto_landing_straight(const hrt_abstime &now, cons
 	const float glide_slope_reference_alt = (_param_fw_lnd_useter.get() ==
 						TerrainEstimateUseOnLanding::kFollowTerrainRelativeLandingGlideSlope) ? terrain_alt : pos_sp_curr.alt;
 
+	const int flare_law = _param_fw_lnd_fl_law.get();
+
 	// flare law 6: approach airspeed and lower airspeed limit from the estimated stall speed instead of the weight
-	if (_param_fw_lnd_fl_law.get() == 6) {
+	if (flare_law == 6) {
 		const float vs_est = updateStallSpeedEstimate(now, _current_altitude - terrain_alt);
 
 		if (PX4_ISFINITE(vs_est)) {
@@ -1513,31 +1504,14 @@ FixedWingModeManager::control_auto_landing_straight(const hrt_abstime &now, cons
 
 		// flaring is a "point of no return"
 		if (!_flare_states.flaring) {
-			_flare_states.flaring = true;
-			_flare_states.start_time = now;
-			_flare_states.initial_height_rate_setpoint = -_local_pos.vz;
-			_flare_states.start_height = _current_altitude - terrain_alt;
-			_flare_states.start_pitch = _pitch;
-			_flare_states.pitch_cmd = _pitch;
-			_flare_states.sink_rate_integral = 0.0f;
-			_flare_states.throttle_integral = 0.0f;
-			_flare_states.attitude_offset = 0.0f;
-			_flare_states.attitude_hold = false;
-			// law 5 starts from the feedforward throttle, law 4 from idle (its deceleration phase)
-			_flare_states.throttle_cmd = (_param_fw_lnd_fl_law.get() == 5) ? _param_fw_lnd_fl_tff.get() : _param_fw_thr_idle.get();
+			// every law starts from the same state; law 6 keeps the approach throttle (no step) as the centre of its
+			// airspeed PI, law 5 starts from the feedforward throttle and law 4 from idle (its deceleration phase)
+			flareStart(_flare_states, now, _current_altitude - terrain_alt);
 
-			if (_param_fw_lnd_fl_law.get() == 6) {
-				// law 6 starts from the approach throttle (no step), around which the airspeed PI works
-				vehicle_thrust_setpoint_s thrust_sp{};
-				_flare_states.throttle_start = (_vehicle_thrust_setpoint_sub.copy(&thrust_sp) && PX4_ISFINITE(thrust_sp.xyz[0]))
-							       ? math::constrain(thrust_sp.xyz[0], _param_fw_thr_idle.get(), _param_fw_thr_max.get())
-							       : _param_fw_lnd_fl_tff.get();
-				_flare_states.throttle_cmd = _flare_states.throttle_start;
-				_flare_states.start_airspeed = _airspeed_eas;
-				_flare_states.touchdown = false;
-				_flare_states.touchdown_timer = 0.0f;
+			if (flare_law != 6) {
+				_flare_states.throttle_cmd = (flare_law == 5) ? _param_fw_lnd_fl_tff.get() : _param_fw_thr_idle.get();
 			}
-			_flare_states.last_update = now;
+
 			events::send(events::ID("fixedwing_position_control_landing_flaring"), events::Log::Info,
 				     "Landing, flaring");
 		}
@@ -1577,8 +1551,6 @@ FixedWingModeManager::control_auto_landing_straight(const hrt_abstime &now, cons
 
 		// interpolator for the pitch limits: 0 at flare start, 1 at touchdown values
 		float flare_limit_interpolator = flare_ramp_interpolator_sqrt;
-
-		const int flare_law = _param_fw_lnd_fl_law.get();
 
 		if (flare_law == 1 || flare_law == 2 || flare_law == 3) {
 			// height based flare: sink rate, limits and throttle follow the height above the touchdown point
@@ -1682,22 +1654,7 @@ FixedWingModeManager::control_auto_landing_straight(const hrt_abstime &now, cons
 
 			pitch_direct = math::constrain(pitch_unsat, pitch_lo, pitch_hi);
 
-			// law 6: the pitch command moves at most FW_LND_FL_PRT deg/s (user: no sudden nose up)
-			bool pitch_rate_up_held = false;
-			bool pitch_rate_down_held = false;
-
-			if (flare_law == 6 && _param_fw_lnd_fl_prt.get() > FLT_EPSILON) {
-				const float step = radians(_param_fw_lnd_fl_prt.get()) * dt;
-				const float limited = _flare_states.pitch_cmd + math::constrain(pitch_direct - _flare_states.pitch_cmd, -step, step);
-				pitch_rate_up_held = pitch_direct > limited + 1e-5f;
-				pitch_rate_down_held = pitch_direct < limited - 1e-5f;
-				pitch_direct = limited;
-			}
-
-			_flare_states.pitch_cmd = pitch_direct;
-
-			if (!(((pitch_unsat >= pitch_hi || pitch_rate_up_held) && sink_error > 0.0f)
-			      || ((pitch_unsat <= pitch_lo || pitch_rate_down_held) && sink_error < 0.0f))) {
+			if (!((pitch_unsat >= pitch_hi && sink_error > 0.0f) || (pitch_unsat <= pitch_lo && sink_error < 0.0f))) {
 				_flare_states.sink_rate_integral += radians(_param_fw_lnd_fl_ki.get()) * sink_error * dt;
 			}
 
@@ -1705,55 +1662,16 @@ FixedWingModeManager::control_auto_landing_straight(const hrt_abstime &now, cons
 			pitch_max_rad = pitch_hi;
 
 			// throttle: PI on the airspeed error to FW_LND_FL_VATT (weight scaled), slew limited; idle below the hold height
-			float weight_ratio = 1.0f;
-
-			if (_param_weight_base.get() > FLT_EPSILON && _param_weight_gross.get() > FLT_EPSILON) {
-				weight_ratio = _param_weight_gross.get() / _param_weight_base.get();
-			}
-
-			float speed_target = _param_fw_lnd_fl_vatt.get() * sqrtf(weight_ratio);
-			float throttle_centre = _param_fw_lnd_fl_tff.get();
-
-			if (flare_law == 6) {
-				// airspeed falling linearly with height from the flare start airspeed to FW_LND_VTD_K x the stall speed at
-				// the hold-off height; without an estimate fall back to law 5's weight scaled FW_LND_FL_VATT
-				throttle_centre = _flare_states.throttle_start;
-
-				if (PX4_ISFINITE(_vs_est)) {
-					const float speed_td = _param_fw_lnd_vtd_k.get() * _vs_est;
-					const float speed_start = math::max(_flare_states.start_airspeed, speed_td);
-					const float span = math::max(_flare_states.start_height - hold_height, 0.1f);
-					const float fraction = math::constrain((height - hold_height) / span, 0.0f, 1.0f);
-					speed_target = speed_td + (speed_start - speed_td) * fraction;
-					_ctrl_configuration_handler.setEquivalentAirspeedMin(1.05f * _vs_est);
-				}
-
-				airspeed_land = speed_target;
-			}
-
+			const float speed_target = _param_fw_lnd_fl_vatt.get() * sqrtf(weightRatio());
 			const bool airspeed_ok = hrt_elapsed_time(&_time_airspeed_sample) < 1_s;
 			const float speed_error = airspeed_ok ? (speed_target - _airspeed_eas) : 0.0f; // > 0: too slow
 			const float thr_min = _param_fw_thr_idle.get();
 			const float thr_max = _param_fw_thr_max.get();
-			// law 6 keeps holding the touchdown airspeed until touchdown: a retard at the hold-off height (law 5) let the
-			// airspeed fall below the stall speed while the pitch loop raised the nose to 10 deg (1200 kg, 2026-11-10)
-			// The fixed wing land detector only triggers at low ground speed, so law 6 latches the touchdown itself: a
-			// downward range finder reading under 1.2 m (0.9 m rolling on the runway) and the sink rate under 0.35 m/s
-			// for 0.5 s. On the ground the EKF sink rate reads 0.2 m/s (2026-11-10), in the air below the hold-off height
-			// it is held at FW_LND_FL_SINK. Without a range finder: below the hold-off height.
-			if (flare_law == 6 && !_flare_states.touchdown) {
-				const bool near_ground = _local_pos.dist_bottom_valid ? (_local_pos.dist_bottom < 1.2f) : (height < hold_height);
-				_flare_states.touchdown_timer = (near_ground && _local_pos.vz < 0.35f) ? _flare_states.touchdown_timer + dt : 0.0f;
-				_flare_states.touchdown = _flare_states.touchdown_timer > 0.5f;
-			}
-
-			const bool touched_down = _landed || (flare_law == 6 && _flare_states.touchdown);
-			const bool retard = (flare_law == 6) ? touched_down : (height < hold_height || _landed);
-			const float thr_unsat = throttle_centre + _param_fw_lnd_fl_tkp.get() * speed_error
+			const bool retard = height < hold_height || _landed;
+			const float thr_unsat = _param_fw_lnd_fl_tff.get() + _param_fw_lnd_fl_tkp.get() * speed_error
 						+ _flare_states.throttle_integral;
 			const float thr_target = retard ? thr_min : math::constrain(thr_unsat, thr_min, thr_max);
-			// on the ground (law 6) the throttle is cut three times faster than in the air
-			const float slew = (flare_law == 6 && touched_down) ? 3.0f * _param_fw_lnd_fl_tslw.get() : _param_fw_lnd_fl_tslw.get();
+			const float slew = _param_fw_lnd_fl_tslw.get();
 			const float thr_prev = _flare_states.throttle_cmd;
 			_flare_states.throttle_cmd = (slew > FLT_EPSILON)
 						     ? thr_prev + math::constrain(thr_target - thr_prev, -slew * dt, slew * dt) : thr_target;
@@ -1765,9 +1683,9 @@ FixedWingModeManager::control_auto_landing_straight(const hrt_abstime &now, cons
 				_flare_states.throttle_integral += _param_fw_lnd_fl_tki.get() * speed_error * dt;
 			}
 
-			throttle_direct = (_landed && flare_law != 6) ? thr_min : _flare_states.throttle_cmd;
+			throttle_direct = _landed ? thr_min : _flare_states.throttle_cmd;
 
-			if (touched_down) {
+			if (_landed) {
 				pitch_direct = radians(_param_rwto_psp.get());
 				pitch_min_rad = math::min(pitch_min_rad, pitch_direct);
 			}
@@ -1789,11 +1707,7 @@ FixedWingModeManager::control_auto_landing_straight(const hrt_abstime &now, cons
 			height_rate_setpoint = -sink_setpoint;
 
 			// weight scaling: airspeeds with sqrt(W / W_base), throttle (thrust ~ throttle^2, thrust ~ W) with W^(1/4)
-			float weight_ratio = 1.0f;
-
-			if (_param_weight_base.get() > FLT_EPSILON && _param_weight_gross.get() > FLT_EPSILON) {
-				weight_ratio = _param_weight_gross.get() / _param_weight_base.get();
-			}
+			const float weight_ratio = weightRatio();
 
 			const float speed_scale = sqrtf(weight_ratio);
 
@@ -2559,7 +2473,7 @@ FixedWingModeManager::Run()
 		case FW_POSCTRL_MODE_AUTO: {
 				// GASI water scoop: the water waypoints (and the climb out of them) are flown by control_auto_scoop
 				if (scoopEngage(_pos_sp_triplet.previous, _pos_sp_triplet.current)) {
-					control_auto_scoop(now, control_interval, ground_speed, _pos_sp_triplet.current);
+					control_auto_scoop(now, ground_speed, _pos_sp_triplet.current);
 
 				} else {
 					control_auto(control_interval, curr_pos, ground_speed, _pos_sp_triplet.previous, _pos_sp_triplet.current,
@@ -3250,7 +3164,7 @@ extern "C" __EXPORT int fw_mode_manager_main(int argc, char *argv[])
 
 
 void
-FixedWingModeManager::law6Start(FlareStates &fs, const hrt_abstime now, const float height)
+FixedWingModeManager::flareStart(FlareStates &fs, const hrt_abstime now, const float height)
 {
 	fs = FlareStates{};
 	fs.flaring = true;
@@ -3327,11 +3241,7 @@ FixedWingModeManager::law6Step(FlareStates &fs, const hrt_abstime now, const flo
 		speed_target = speed_td + (speed_start - speed_td) * fraction;
 
 	} else {
-		float weight_ratio = 1.0f;
-
-		if (_param_weight_base.get() > FLT_EPSILON && _param_weight_gross.get() > FLT_EPSILON) {
-			weight_ratio = _param_weight_gross.get() / _param_weight_base.get();
-		}
+		const float weight_ratio = weightRatio();
 
 		speed_target = _param_fw_lnd_fl_vatt.get() * sqrtf(weight_ratio);
 	}
@@ -3430,12 +3340,40 @@ FixedWingModeManager::setScoopPhase(const hrt_abstime now, ScoopPhase phase, con
 		mavlink_log_info(&_mavlink_log_pub, "SU: %s\t", scoopPhaseName(phase));
 	}
 
+	publishScoopPhase(now);
+}
+
+void
+FixedWingModeManager::publishScoopPhase(const hrt_abstime now)
+{
 	debug_key_value_s dbg{};
 	strncpy(dbg.key, "SU_ASAMA", sizeof(dbg.key) - 1);
-	dbg.value = static_cast<float>(phase);
+	dbg.value = static_cast<float>(_scoop.phase);
 	dbg.timestamp = now;
 	_debug_key_value_pub.publish(dbg);
 	_scoop.last_status = now;
+}
+
+void
+FixedWingModeManager::publishCommandAck(const vehicle_command_s &cmd, const uint8_t result)
+{
+	vehicle_command_ack_s ack{};
+	ack.command = cmd.command;
+	ack.result = result;
+	ack.target_system = cmd.source_system;
+	ack.target_component = cmd.source_component;
+	ack.timestamp = hrt_absolute_time();
+	_vehicle_command_ack_pub.publish(ack);
+}
+
+float
+FixedWingModeManager::weightRatio() const
+{
+	if (_param_weight_base.get() > FLT_EPSILON && _param_weight_gross.get() > FLT_EPSILON) {
+		return _param_weight_gross.get() / _param_weight_base.get();
+	}
+
+	return 1.0f;
 }
 
 void
@@ -3473,19 +3411,14 @@ FixedWingModeManager::scoopEngage(const position_setpoint_s &pos_sp_prev, const 
 }
 
 void
-FixedWingModeManager::control_auto_scoop(const hrt_abstime &now, const float control_interval,
+FixedWingModeManager::control_auto_scoop(const hrt_abstime &now,
 		const Vector2f &ground_speed, const position_setpoint_s &pos_sp_curr)
 {
 	const float dt = math::constrain((now - _scoop.last_update) * 1e-6f, 0.001f, 0.1f);
 	_scoop.last_update = now;
 
 	if (now - _scoop.last_status > 500_ms) {
-		debug_key_value_s dbg{};
-		strncpy(dbg.key, "SU_ASAMA", sizeof(dbg.key) - 1);
-		dbg.value = static_cast<float>(_scoop.phase);
-		dbg.timestamp = now;
-		_debug_key_value_pub.publish(dbg);
-		_scoop.last_status = now;
+		publishScoopPhase(now);
 	}
 
 	const Vector2f local_position{_local_pos.x, _local_pos.y};
@@ -3571,7 +3504,7 @@ FixedWingModeManager::control_auto_scoop(const hrt_abstime &now, const float con
 
 				} else {
 					setScoopPhase(now, ScoopPhase::GATE_PASSED);
-					law6Start(_scoop.flare, now, height);
+					flareStart(_scoop.flare, now, height);
 					setScoopPhase(now, ScoopPhase::FLARE);
 				}
 			}
@@ -3842,5 +3775,4 @@ FixedWingModeManager::control_auto_scoop(const hrt_abstime &now, const float con
 
 	_longitudinal_ctrl_sp_pub.publish(lon_sp);
 	_ctrl_configuration_handler.setThrottleMax(_param_fw_thr_max.get());
-	(void)control_interval;
 }

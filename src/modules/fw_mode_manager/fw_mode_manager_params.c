@@ -581,8 +581,9 @@ PARAM_DEFINE_INT32(FW_LND_FL_LAW, 0);
 /**
  * Landing flare hold-off height
  *
- * Height above the touchdown point at which the height based flare laws (FW_LND_FL_LAW 1 and 2) reach
- * FW_LND_FL_SINK and the touchdown pitch limits. Below it the sink rate stays at FW_LND_FL_SINK.
+ * Height above the touchdown point at which the height based flare laws (FW_LND_FL_LAW 1-3) reach
+ * FW_LND_FL_SINK and the touchdown pitch limits; laws 4-6 hold FW_LND_FL_SNK1 above it. Below it the sink rate
+ * stays at FW_LND_FL_SINK.
  *
  * @unit m
  * @min 0.0
@@ -611,7 +612,7 @@ PARAM_DEFINE_FLOAT(FW_LND_FL_SPDW, -1.0f);
 /**
  * Landing flare sink rate to pitch proportional gain
  *
- * Flare law 3 only. Pitch change per sink rate error.
+ * Flare laws 3-6 (law 4 while decelerating) and the water scoop flare. Pitch change per sink rate error.
  *
  * @unit deg
  * @min 0.0
@@ -625,7 +626,7 @@ PARAM_DEFINE_FLOAT(FW_LND_FL_KP, 3.0f);
 /**
  * Landing flare sink rate to pitch integral gain
  *
- * Flare law 3 only. Pitch change per second per sink rate error.
+ * Flare laws 3-6 (law 4 while decelerating) and the water scoop flare. Pitch change per second per sink rate error.
  *
  * @unit deg
  * @min 0.0
