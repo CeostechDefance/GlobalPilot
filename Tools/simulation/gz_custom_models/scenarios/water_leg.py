@@ -26,6 +26,10 @@ from gz.transport13 import Node
 from PIL import Image
 from pymavlink import mavutil
 
+from otonom.planlayici import su_alma as SA
+from otonom.planlayici.geo import along, bearing_deg, distance_m
+from otonom.rehber import THRUST_MAX_N
+
 M = mavutil.mavlink
 WORLD = 'antalya'
 WATER_MODEL = 'geo_terrain_water'
@@ -38,11 +42,12 @@ LAND_REL_M = 0.0                  # iniş noktasında pist, eve göre; tek baş�
 # Hız sınırları PX4 parametrelerinden (kullanıcı 2026-11-27; otonom/planlayici/su_alma.py HizSiniri): gaz kontrol bandını
 # (SPEED_MIN_MS .. FW_SC_VMAX) hedefler, pencere ve dolum orada; su alma ancak iptal bandı (FW_SC_A_VMIN .. FW_SC_A_VMAX)
 # dışında toplam FW_SC_OOB_T'den uzun kalınırsa başarısız. Önceden sabit 80-100 km/h ve bant dışı süre sıfırdı.
-SCOOP_MIN_S, SCOOP_MAX_S = 8.0, 12.0
-SPEED_MIN_MS = 80 / 3.6           # kontrol bandı alt sınırı (PX4 yolunda görev maddesinin param4'ü), yuvarlatmadan
+# Süre, hız ve irtifa sayıları planlayıcıda (otonom/planlayici/su_alma.py SuAlmaAyar); iki su alma yolu da onları kullanır.
+SU_AYAR = SA.SuAlmaAyar()
+SPEED_MIN_MS = SU_AYAR.bant_alt_ms   # kontrol bandı alt sınırı (PX4 yolunda görev maddesinin param4'ü), yuvarlatmadan
 HIZ_SINIRI = None                 # SA.HizSiniri; fire_attack yerde PX4'ten okur, yoksa su bölümü başında okunur
-SCOOP_TARGET_S = 10.0
-SPEED_TARGET_MS = 25.0
+SCOOP_TARGET_S = SU_AYAR.sure_s
+SPEED_TARGET_MS = SU_AYAR.hedef_hiz_ms
 THROTTLE_PARAM = b'FW_THR_MAX'
 GEAR_UP_MIN_WHEEL_Z = -0.45       # sol tekerlek modele göre: kapalı ~-0,31, açık -0,69
 GEAR_WAIT_S = 5.0
@@ -51,8 +56,7 @@ THROTTLE_BASE = 0.65              # 25 m/s için; kütleli görevde giriş boşt
 # Su alırken durgun su uçak hızına çıkarılır: momentum direnci ṁ·v (WaterPhysics, 5d incelemesi). Taban gaza eklenir:
 # gaz = sqrt(THROTTLE_BASE² + ṁ·v / itki_en_çok). itki gazın karesiyle orantılı, en çok 5002 N; ṁ = water_tank.txt fill_rate.
 # Uçuş n5 (dirençli, eski taban 0,65): pencerede hız 22,6 m/s'ye düştü (sınır 22,22).
-SCOOP_FILL_RATE_KGS = 40.0
-THRUST_MAX_N = 5002.0
+SCOOP_FILL_RATE_KGS = 40.0             # itki üst sınırı rehber.THRUST_MAX_N
 THROTTLE_GAIN = 0.06              # (m/s) başına; 0,715 gazda itki eğimi yüksek olduğu için azaltıldı
 THROTTLE_EXPECTED_ORIGINAL = 1.0  # farklıysa önceki uçuştan parameters.bson'a kalmış ara değer olabilir
 THROTTLE_MIN_CHANGE = 0.01        # daha küçük farklar gönderilmez: her değişiklik PX4'te parametre kaydı tetikler
@@ -70,8 +74,8 @@ SEARCH_STEP_M = 500.0
 SEARCH_BEARING_STEP_DEG = 15
 # Kullanıcı kararı (2026-11-10): uçak yerden en az 100 m yukarıda kalır; irtifa karanın üstünde kaybedilir ve suya 100 m'de
 # gelinir. Hizalanmanın gerektirdiği su üstü yol 150 m'den ~4,75 km iken 100 m'den ~3,8-3,9 km (800/1200 kg).
-APPROACH_ABOVE_WATER_M = 100.0
-CLIMB_ABOVE_WATER_M = 150.0
+APPROACH_ABOVE_WATER_M = SU_AYAR.yaklasma_ustu_m
+CLIMB_ABOVE_WATER_M = SU_AYAR.tirmanis_ustu_m
 # Geçişte hedef, su yüzeyinin altındadır: PX4 irtifa hatası (ölçülen ~2 m) yüzünden uçak yüzeyde hedeflenince suya değmiyor.
 # Uçak kaldırma ve kayma basıncıyla yüzeyde kalır; ölçülen derinlik bu hedeften bağımsız ~0,3 m.
 RUN_TARGET_BELOW_SURFACE_M = 3.0
@@ -142,17 +146,6 @@ def body_axes(rotation):
     return roll, pitch, yaw
 
 
-def along(lat, lon, bearing_deg, distance, right=0.0):
-    b = math.radians(bearing_deg)
-    north = distance * math.cos(b) - right * math.sin(b)
-    east = distance * math.sin(b) + right * math.cos(b)
-    return lat + north / 111320.0, lon + east / (111320.0 * math.cos(math.radians(lat)))
-
-
-def distance_m(a, b):
-    return math.hypot((b[0] - a[0]) * 111320.0, (b[1] - a[1]) * 111320.0 * math.cos(math.radians(a[0])))
-
-
 class WaterMap:
     """Su maskesi: kıyı ve bölge sınırı dahil. Kaynak kamera değil, dünyayı üreten harita verisi."""
 
@@ -190,10 +183,10 @@ class WaterMap:
         lats = np.arange(self.south, self.north, step_lat)
         lons = np.arange(self.west, self.east, step_lon)
         candidates = [(lat, lon) for lat in lats for lon in lons if self.is_water(lat, lon)]
-        candidates.sort(key=lambda c: distance_m(position, c))
+        candidates.sort(key=lambda c: distance_m(*position, *c))
         for start in candidates:
             # uçağa dönük yönleri önce dene: yaklaşma uçağın geldiği taraftan başlasın
-            toward = math.degrees(math.atan2((position[1] - start[1]) * math.cos(math.radians(start[0])), position[0] - start[0]))
+            toward = bearing_deg(*start, *position)
             for offset in sorted(range(0, 360, SEARCH_BEARING_STEP_DEG), key=lambda a: abs((a + 180) % 360 - 180)):
                 course = (toward + 180.0 + offset) % 360
                 if self.corridor_clear(start, course, total):
@@ -222,8 +215,8 @@ class WaterSurface:
 
     def z_at(self, x, y):
         d2 = (self.vertices[:, 0] - x) ** 2 + (self.vertices[:, 1] - y) ** 2
-        near = np.argsort(d2)[:6]
-        if d2[near[0]] > 300.0 ** 2:
+        near = np.argpartition(d2, 5)[:6]   # en yakın 6 köşe (sırasız; düzlem uydurma sıradan bağımsız)
+        if d2[near].min() > 300.0 ** 2:
             return None
         a = np.column_stack((self.vertices[near, 0], self.vertices[near, 1], np.ones(6)))
         coef = np.linalg.lstsq(a, self.vertices[near, 2], rcond=None)[0]
@@ -280,6 +273,7 @@ def run_offboard_alignment(vehicle, items, info, telemetry, surface, model, opti
     Bu sürede bağlantıyı yalnız otonom.Baglanti okur; sonra vehicle.update kaldığı yerden sürer."""
     from otonom import rehber
     from otonom.baglanti import Baglanti
+    from otonom.planlayici.rota import read_px4_params
     from otonom.hizalanma import Hizalanma, Plan
     from otonom.kayit import Kayit
     from otonom.sensor import SimTankKutlesi, SimYukseklik
@@ -292,11 +286,8 @@ def run_offboard_alignment(vehicle, items, info, telemetry, surface, model, opti
     record.karar('plan', hat=[info['run_start'][0], info['run_start'][1], info['run_course']], su=info['water_height'])
     link = Baglanti(vehicle.link, log).start()
     try:
-        # suya değiş pistteki iniş flare'i (yasa 3) ile aynı: değerler PX4'ten
-        values = {name: link.read_param(name) for name in rehber.REHBER_PX4_PARAMS}
-        missing = [name for name, value in values.items() if value is None]
-        if missing:
-            raise RuntimeError(f'PX4 parametreleri okunamadı: {", ".join(missing)}')
+        # suya değiş yasası rehber'de (varsayılan yasa 6); kapı, alçalma ve tutma yüksekliği PX4'ten
+        values = read_px4_params(link.read_param, rehber.REHBER_PX4_PARAMS)
         ayar = rehber.ayar_from_px4(values)
         record.karar('rehber parametreleri', **values)
         log('rehber: ' + ', '.join(f'{k} {v:g}' for k, v in values.items()))
@@ -315,13 +306,11 @@ def run_offboard_alignment(vehicle, items, info, telemetry, surface, model, opti
 # İniş takımı DO_SET_ACTUATOR ile (kullanıcı kararı 2026-11-08): takım servosu 'Peripheral via Actuator Set 1' (301)
 # olmalı (SIM_GZ_SV_FUNC5 301). PX4'ün kendi takım işlevi (400) kalkış adımı CLIMBOUT'tan önce biterse takımı toplamıyordu
 # (k5, n6). Değerler PX4 takım işleviyle aynı: +1 kapalı, -1 açık. İşlev 400 iken bu adımlar etkisizdir (gösteri değişmez).
-GEAR_FUNCTION_ACTUATOR_SET1 = 301
 MAV_CMD_DO_SET_ACTUATOR = 187      # MAVLink ortak komutu; kurulu pymavlink lehçesinde adı yok
 GEAR_UP_VALUE, GEAR_DOWN_VALUE = 1.0, -1.0
 GEAR_DOWN_MAX_WHEEL_Z = -0.6        # sol tekerlek: açık -0,69, kapalı ~-0,31
 # Takım adımları görevlere eklenir (airframe 4022 SIM_GZ_SV_FUNC5 301, herkes için; kullanıcı kararı 2026-11-08).
-# Yükleyici görev çerçevesini (item['frame']) göndermelidir: fire_attack.Vehicle, StandaloneVehicle, otonom.Baglanti gönderir.
-USE_GEAR_ACTUATOR = True
+# Yükleyici görev çerçevesini (item['frame']) göndermelidir: fire_attack.Vehicle ve StandaloneVehicle gönderir.
 
 
 def gear_item(up):
@@ -338,11 +327,9 @@ def gear_command(vehicle, up):
     vehicle.command(MAV_CMD_DO_SET_ACTUATOR, GEAR_UP_VALUE if up else GEAR_DOWN_VALUE, nan, nan, nan, nan, nan, 0)
 
 
-def return_items(home, cruise_rel=CRUISE_REL_M, gear=None):
+def return_items(home, cruise_rel=CRUISE_REL_M):
     """PX4 görevi iniş adımı ister: pist dönüşü. Birleşik görev kendi görevini yükler.
-    gear (varsayılan USE_GEAR_ACTUATOR): takım taban bacağından sonra DO_SET_ACTUATOR ile açılır."""
-    if gear is None:
-        gear = USE_GEAR_ACTUATOR
+    Takım taban bacağından sonra DO_SET_ACTUATOR ile açılır."""
     head = GROUND_ROLL_HEADING_DEG
     wp = M.MAV_CMD_NAV_WAYPOINT
     a = along(*home, head, 4000, 1200)
@@ -350,9 +337,8 @@ def return_items(home, cruise_rel=CRUISE_REL_M, gear=None):
     c = along(*home, head, -1800)
     land = along(*home, head, 1200)
     items = [dict(name='Piste dönüş', cmd=wp, lat=a[0], lon=a[1], alt=cruise_rel),
-             dict(name='Taban bacağı', cmd=wp, lat=b[0], lon=b[1], alt=120)]
-    if gear:
-        items.append(gear_item(up=False))
+             dict(name='Taban bacağı', cmd=wp, lat=b[0], lon=b[1], alt=120),
+             gear_item(up=False)]
     items += [dict(name='Son yaklaşma', cmd=wp, lat=c[0], lon=c[1], alt=120),
               dict(name='İniş', cmd=M.MAV_CMD_NAV_LAND, lat=land[0], lon=land[1], alt=LAND_REL_M)]
     return items
@@ -371,7 +357,6 @@ def read_param(vehicle, name, timeout=3.0):
 
 def hiz_siniri(vehicle):
     """Su alma hız sınırları (SA.HizSiniri): yerde okunmuşsa o, değilse şimdi PX4'ten. Okunamazsa RuntimeError."""
-    from otonom.planlayici import su_alma as SA
     return HIZ_SINIRI or SA.hiz_siniri_px4(lambda name: read_param(vehicle, name.encode()))
 
 
@@ -396,6 +381,16 @@ def restore_throttle(vehicle, original, result, log):
     log(f"UYARI: FW_THR_MAX geri alınamadı, okunan {result['throttle_after']}, özgün {original}")
 
 
+def wait_gear_up(vehicle, telemetry):
+    """Takım toplanana dek en çok GEAR_WAIT_S bekler; sol tekerleğin z'si (toplu: GEAR_UP_MIN_WHEEL_Z üstü)."""
+    end = time.time() + GEAR_WAIT_S
+    wheel = telemetry.snapshot()[3]
+    while not wheel > GEAR_UP_MIN_WHEEL_Z and time.time() < end:
+        vehicle.update(0.2)
+        wheel = telemetry.snapshot()[3]
+    return wheel
+
+
 def run_water_leg(vehicle, home, model, timeout=720.0, log=print, offboard_alignment=None):
     """Uçak havadayken çağrılır. timeout gerçek saniye; süreler ve hız simülasyon saatiyle ölçülür.
 
@@ -403,11 +398,9 @@ def run_water_leg(vehicle, home, model, timeout=720.0, log=print, offboard_align
     offboard_alignment: None (varsayılan, eski davranış) ya da dict(record=<jsonl yolu>, empty_mass_kg, default_mass_kg).
     Verilirse suya hizalanma ve değiş offboard durum makinesiyle (otonom.hizalanma) yapılır; su alma ve gaz mantığı aynı kalır.
 
-    ok yalnızca pencere SCOOP_MIN_S-SCOOP_MAX_S sürüp hız PX4 iptal bandı (FW_SC_A_VMIN-FW_SC_A_VMAX) dışında toplam
-    FW_SC_OOB_T'den uzun kalmadıysa, gaz sınırı geri alındıysa ve uçak sudan ayrılıp RELEASE_ABOVE_WATER_M üstüne
-    çıktıysa True.
+    ok yalnızca pencere su_alma.pencere_kabul ölçütünü tuttuysa (süre ve PX4 iptal bandı), gaz sınırı geri alındıysa ve
+    uçak sudan ayrılıp RELEASE_ABOVE_WATER_M üstüne çıktıysa True.
     """
-    from otonom.planlayici import su_alma as SA
     started = time.time()
     home = tuple(home[:2])  # fire_attack (enlem, boylam, AMSL) verir
     surface = WaterSurface(home)
@@ -426,37 +419,30 @@ def run_water_leg(vehicle, home, model, timeout=720.0, log=print, offboard_align
                   out_of_abort_s=0.0, liftoff_speed=None, liftoff_pitch_up_deg=None,
                   exit_aoa_deg=None, airspeed_min=None, lowest=None, max_roll=0.0, wheel_z=None, water_height=info['water_height'],
                   climb_end=info['climb_end'], throttle_original=None, throttle_after=None, throttle_restored=None)
+
+    def finish(reason=None):
+        if reason is not None:
+            result['reason'] = reason
+            log(reason)
+        result.update(lat=vehicle.state['lat'], lon=vehicle.state['lon'], seconds=time.time() - started)
+        return result
+
     try:
         siniri = hiz_siniri(vehicle)
     except RuntimeError as error:
-        result['reason'] = f'{error}; su bölümü başlatılmadı'
-        log(result['reason'])
-        result.update(lat=vehicle.state['lat'], lon=vehicle.state['lon'], seconds=time.time() - started)
-        return result
+        return finish(f'{error}; su bölümü başlatılmadı')
     # Takım açıkken suya girmek uçağı devirir (ölçüldü): görev yüklenmeden denetlenir, ölçülemiyorsa da başlanmaz
-    gear_end = time.time() + GEAR_WAIT_S
-    wheel = telemetry.snapshot()[3]
-    while not wheel > GEAR_UP_MIN_WHEEL_Z and time.time() < gear_end:
-        vehicle.update(0.2)
-        wheel = telemetry.snapshot()[3]
-    result['wheel_z'] = wheel
+    wheel = result['wheel_z'] = wait_gear_up(vehicle, telemetry)
     if not wheel > GEAR_UP_MIN_WHEEL_Z:
-        result['reason'] = f'iniş takımı toplu değil (tekerlek z {wheel:.3f}); su bölümü başlatılmadı'
-        log(result['reason'])
-        result.update(lat=vehicle.state['lat'], lon=vehicle.state['lon'], seconds=time.time() - started)
-        return result
+        return finish(f'iniş takımı toplu değil (tekerlek z {wheel:.3f}); su bölümü başlatılmadı')
     # Görev yüklenmeden denetlenir: uçak düşük gaz sınırıyla suya yönelmesin
     original = read_param(vehicle, THROTTLE_PARAM)
     result['throttle_original'] = original
     if original is None:
-        result['reason'] = 'FW_THR_MAX okunamadı; su bölümü başlatılmadı'
-    elif abs(original - THROTTLE_EXPECTED_ORIGINAL) > 1e-3:
+        return finish('FW_THR_MAX okunamadı; su bölümü başlatılmadı')
+    if abs(original - THROTTLE_EXPECTED_ORIGINAL) > 1e-3:
         # Bu değer "özgün" sayılıp geri yazılırsa düşük gaz sınırı kalıcı olur
-        result['reason'] = f'FW_THR_MAX {original:.3f}, beklenen {THROTTLE_EXPECTED_ORIGINAL:.3f}; su bölümü başlatılmadı'
-    if original is None or abs(original - THROTTLE_EXPECTED_ORIGINAL) > 1e-3:
-        log(result['reason'])
-        result.update(lat=vehicle.state['lat'], lon=vehicle.state['lon'], seconds=time.time() - started)
-        return result
+        return finish(f'FW_THR_MAX {original:.3f}, beklenen {THROTTLE_EXPECTED_ORIGINAL:.3f}; su bölümü başlatılmadı')
 
     all_items = items + return_items(home)
     vehicle.upload(all_items)
@@ -469,10 +455,7 @@ def run_water_leg(vehicle, home, model, timeout=720.0, log=print, offboard_align
         alignment = run_offboard_alignment(vehicle, items, info, telemetry, surface, model, offboard_alignment, log)
         result['alignment'] = alignment
         if not alignment['ok']:
-            result['reason'] = f"offboard hizalanma: {alignment['reason']}"
-            log(result['reason'])
-            result.update(lat=vehicle.state['lat'], lon=vehicle.state['lon'], seconds=time.time() - started)
-            return result
+            return finish(f"offboard hizalanma: {alignment['reason']}")
 
     history = []  # (sim saati, konum)
     contact_start = None
@@ -492,7 +475,7 @@ def run_water_leg(vehicle, home, model, timeout=720.0, log=print, offboard_align
     last_print = 0.0
     last_sim = None
     try:
-        while time.time() - started < timeout and original is not None:
+        while time.time() - started < timeout:
             vehicle.update(0.1)
             sim, position, rotation, wheel = telemetry.snapshot()
             if sim is None or sim == last_sim:
@@ -606,15 +589,7 @@ def run_water_leg(vehicle, home, model, timeout=720.0, log=print, offboard_align
                 result['reason'] = f"temas yok: tırmanışa geçildi, en düşük {result['lowest']:.2f} m"
                 break
             if contact_start is not None and clear is not None and clear > RELEASE_ABOVE_WATER_M:
-                problems = []
-                if result['scoop_s'] is None:
-                    problems.append('su alma penceresi tamamlanmadı')
-                else:
-                    if not SCOOP_MIN_S <= result['scoop_s'] <= SCOOP_MAX_S:
-                        problems.append(f"pencere {result['scoop_s']:.1f} s, şart {SCOOP_MIN_S:.0f}-{SCOOP_MAX_S:.0f} s")
-                    speed_ok, why = SA.hiz_kabul(result['out_of_abort_s'], siniri)
-                    if not speed_ok:
-                        problems.append(why)
+                problems = SA.pencere_kabul(result['scoop_s'], result['out_of_abort_s'], siniri, SU_AYAR)
                 result.update(ok=not problems, reason='; '.join(problems) or None)
                 break
             if contact_start is not None and speed < 5.0 and sim - contact_start > 30.0:
@@ -629,8 +604,7 @@ def run_water_leg(vehicle, home, model, timeout=720.0, log=print, offboard_align
         # Uçak denizde kaldı: motoru güvene al
         vehicle.command(M.MAV_CMD_COMPONENT_ARM_DISARM, 0, 21196)
         log('uçak suda kaldı, motor kesildi')
-    result.update(lat=vehicle.state['lat'], lon=vehicle.state['lon'], seconds=time.time() - started)
-    return result
+    return finish()
 
 
 # PX4 içinde su alma (kullanıcı kararı 2026-11-11, arayüz v1: otonom/planlayici/su_alma.py). Uçuşu PX4 yapar; burada görev
@@ -643,9 +617,8 @@ PX4_LOITER_WAIT_S = 90.0             # iptal sonrası tırmanış ve bekleme iç
 def run_water_leg_px4(vehicle, home, model, timeout=720.0, log=print):
     """run_water_leg ile aynı sözleşme (dönüş dict'i aynı alanlar + px4_* alanları). Uçak havada, görev modunda."""
     from otonom.baglanti import Baglanti, PX4_AUTO_LOITER, PX4_AUTO_MISSION, PX4_MAIN_AUTO
-    from otonom.planlayici import su_alma as SA
     import queue
-    ayar = SA.SuAlmaAyar()
+    ayar = SU_AYAR
     started = time.time()
     home = tuple(home[:2])
     surface = WaterSurface(home)
@@ -676,12 +649,7 @@ def run_water_leg_px4(vehicle, home, model, timeout=720.0, log=print):
         result.update(lat=st['lat'], lon=st['lon'], seconds=time.time() - started)
         return result
 
-    gear_end = time.time() + GEAR_WAIT_S
-    wheel = telemetry.snapshot()[3]
-    while not wheel > GEAR_UP_MIN_WHEEL_Z and time.time() < gear_end:
-        vehicle.update(0.2)
-        wheel = telemetry.snapshot()[3]
-    result['wheel_z'] = wheel
+    wheel = result['wheel_z'] = wait_gear_up(vehicle, telemetry)
     if not wheel > GEAR_UP_MIN_WHEEL_Z:
         return finish(f'iniş takımı toplu değil (tekerlek z {wheel:.3f}); su bölümü başlatılmadı')
     if read_param(vehicle, PX4_SCOOP_PARAM) is None:
@@ -862,15 +830,7 @@ def run_water_leg_px4(vehicle, home, model, timeout=720.0, log=print):
             if m['contact'] is None and s['seq'] > run_end_seq and clear is not None and clear > RELEASE_ABOVE_WATER_M:
                 return finish(f"temas yok: su hattı sonu geçildi, en düşük {result['lowest']}")
             if m['contact'] is not None and m['left'] and clear is not None and clear > RELEASE_ABOVE_WATER_M:
-                problems = []
-                if result['scoop_s'] is None:
-                    problems.append('su alma penceresi yok (hız banda girmedi)')
-                else:
-                    if not ayar.sure_min_s <= result['scoop_s'] <= ayar.sure_max_s:
-                        problems.append(f"pencere {result['scoop_s']:.1f} s, şart {ayar.sure_min_s:.0f}-{ayar.sure_max_s:.0f} s")
-                    speed_ok, why = SA.hiz_kabul(result['out_of_abort_s'], siniri)
-                    if not speed_ok:
-                        problems.append(why)
+                problems = SA.pencere_kabul(result['scoop_s'], result['out_of_abort_s'], siniri, ayar)
                 if tank is not None:
                     w = tank.read()
                     result['tank_kg'] = None if w is None else w - (tank_start or 0.0)

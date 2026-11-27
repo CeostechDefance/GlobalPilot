@@ -1,5 +1,6 @@
 """Piste dönüş deseni (otonom/planlayici/pist.py): kısa yön, düz giriş, taban yanı, arazi eleme."""
 import math
+from otonom.planlayici import geo as G
 from otonom.planlayici import pist as PL
 
 N = (36.726091, 28.796766)
@@ -9,20 +10,20 @@ FLAT = lambda lat, lon: 5.0  # noqa: E731
 
 
 def test_from_south_lands_01_straight_in():
-    start = PL._along(*S, 195.68, 9000.0)
+    start = G.along(*S, 195.68, 9000.0)
     plan = PL.plan_runway_return(start, 300.0, 15.0, DIRS, 6.0, FLAT)
     assert plan.runway.name == '01' and plan.entry == 'düz giriş'
     assert [p[0] for p in plan.points][0] == 'Son yaklaşma'
 
 
 def test_from_north_lands_19_straight_in():
-    start = PL._along(*N, 15.68, 9000.0)
+    start = G.along(*N, 15.68, 9000.0)
     plan = PL.plan_runway_return(start, 300.0, 195.0, DIRS, 6.0, FLAT)
     assert plan.runway.name == '19' and plan.entry == 'düz giriş'
 
 
 def test_from_side_uses_base_on_own_side():
-    start = PL._along(*N, 285.68, 7000.0)   # 19'a göre sağ (batı) yanda, pist ortası hizasında
+    start = G.along(*N, 285.68, 7000.0)   # 19'a göre sağ (batı) yanda, pist ortası hizasında
     plan = PL.plan_runway_return(start, 300.0, 105.0, DIRS, 6.0, FLAT)
     assert plan.entry.startswith('taban')
     assert plan.points[0][0] == 'Taban bacağı'
@@ -30,33 +31,31 @@ def test_from_side_uses_base_on_own_side():
 
 
 def test_terrain_rejects_and_none_when_all_blocked():
-    start = PL._along(*S, 195.68, 9000.0)
+    start = G.along(*S, 195.68, 9000.0)
     wall = lambda lat, lon: 1000.0  # noqa: E731
     plan = PL.plan_runway_return(start, 300.0, 15.0, DIRS, 6.0, wall)
     assert not plan.ok and len(plan.rejected) >= 4 and all(why for _, why in plan.rejected)
 
 
 def test_glide_terrain_checked():
-    start = PL._along(*S, 195.68, 9000.0)
-    final = PL._along(*S, 15.68, -4500.0)
-    land = PL._along(*S, 15.68, 1200.0)
+    start = G.along(*S, 195.68, 9000.0)
 
     def hill(lat, lon):   # 01 süzülüşünün başında 140 m tepe (süzülüş ~145 m, pay 15 m)
-        mid = PL._along(*S, 15.68, -1500.0)
-        return 140.0 if PL._dist((lat, lon), mid) < 200.0 else 5.0
+        mid = G.along(*S, 15.68, -1500.0)
+        return 140.0 if G.distance_m(lat, lon, *mid) < 200.0 else 5.0
     plan = PL.plan_runway_return(start, 300.0, 15.0, DIRS[1:], 6.0, hill)
     assert not plan.ok
 
 
 def test_straight_in_needs_room():
-    final = PL._along(*S, 15.68, -4500.0)
-    start = PL._along(*final, 15.68, -300.0)   # son yaklaşma başının 300 m gerisi: iki yarıçaptan yakın
+    final = G.along(*S, 15.68, -4500.0)
+    start = G.along(*final, 15.68, -300.0)   # son yaklaşma başının 300 m gerisi: iki yarıçaptan yakın
     plan = PL.plan_runway_return(start, 300.0, 15.0, DIRS[1:], 6.0, FLAT)
     assert plan.entry != 'düz giriş'
 
 
 def test_shorter_direction_wins():
-    start = PL._along(*S, 195.68, 9000.0)
+    start = G.along(*S, 195.68, 9000.0)
     plan = PL.plan_runway_return(start, 300.0, 15.0, DIRS, 6.0, FLAT)
     other = PL.plan_runway_return(start, 300.0, 15.0, DIRS[:1], 6.0, FLAT)
     assert plan.length_m < other.length_m
@@ -64,16 +63,13 @@ def test_shorter_direction_wins():
 
 # İlk dönüş (2026-11-27): uçağın yönü verilince desenin ilk noktasına Dubins yolu, yay noktaları ve koridorlu arazi.
 EMPTY = PL.PistAyar(airspeed=36.7)                      # boş uçak: yarıçap ~370 m
-START = PL._along(*S, 120.0, 6000.0)                    # 01 pist başının doğu-güneydoğusu
+START = G.along(*S, 120.0, 6000.0)                    # 01 pist başının doğu-güneydoğusu
 COURSE = 82.0                                           # pistten uzaklaşan yön: dönüş ~180°
 
 
 def _track(p, origin=START, course=COURSE):
     """p'nin origin'e göre (ileri, sağa) uzaklığı (m)."""
-    n = (p[0] - origin[0]) * PL.R_EARTH_LAT
-    e = (p[1] - origin[1]) * PL.R_EARTH_LAT * math.cos(math.radians(origin[0]))
-    b = math.radians(course)
-    return n * math.cos(b) + e * math.sin(b), -n * math.sin(b) + e * math.cos(b)
+    return G.track_errors(p[0], p[1], origin, course)
 
 
 def _ridge_right(lat, lon):
@@ -90,12 +86,6 @@ def test_u_turn_goes_away_from_ridge():
     assert _track(plan.transition[0][1])[1] < 0.0          # ilk yay noktası solda
     assert all(_ridge_right(*p) < 100.0 for _, p, _ in plan.transition)
     assert plan.min_clearance_m >= EMPTY.margin_m
-
-
-def test_straight_check_alone_misses_the_ridge():
-    """Eski denetim (yön yok, düz çizgi) aynı sırtı görmüyordu: uçak dönüşü kısa yönden yapabilirdi."""
-    plan = PL.plan_runway_return(START, 300.0, None, DIRS, 6.0, _ridge_right, EMPTY)
-    assert plan.ok and not plan.transition
 
 
 def test_first_arc_holds_altitude():
@@ -135,7 +125,7 @@ def test_low_start_climb_is_rate_limited():
 def test_low_start_from_sea_climbs_out():
     """Su bölümünden sonra uçak denizin ~35 m üstünde: kalkıştaki gibi pay ve koridor dar başlar, büyür. Kıyıdaki alçak
     arazi (20 m) dönüşü kapatmaz; aynı yükseklikte karadan başlangıçta tam pay istenir."""
-    start = PL._along(*S, 200.0, 12000.0)            # 01 pist başının güneyi, denizde
+    start = G.along(*S, 200.0, 12000.0)            # 01 pist başının güneyi, denizde
 
     def coast(lat, lon):
         along, _ = _track((lat, lon), start, 0.0)
@@ -167,7 +157,7 @@ def test_unreachable_waypoint_altitude_rejected():
     frame = PL.R.YerelCerceve(*START)
     path = PL.D.shortest(PL.D.Poz(0.0, 0.0, 0.0), PL.D.Poz(0.0, 3000.0, 0.0), 370.0)
     wps = [(1000.0, 0.0, 1000.0, 306.0, 'S', False), (3000.0, 0.0, 3000.0, 306.0, 'S', False)]
-    ok, _, why = PL._fly(path, wps, 66.0, 66.0, FLAT, frame, EMPTY)
+    ok, _, why = PL._fly(path, wps, 66.0, FLAT, frame, EMPTY)
     assert not ok and 'döner' in why
     reachable = [(1000.0, 0.0, 1000.0, 66.0 + 0.07 * 1000.0, 'S', False), (3000.0, 0.0, 3000.0, 66.0 + 0.07 * 3000.0, 'S', False)]
-    assert PL._fly(path, reachable, 66.0, 66.0, FLAT, frame, EMPTY)[0]
+    assert PL._fly(path, reachable, 66.0, FLAT, frame, EMPTY)[0]

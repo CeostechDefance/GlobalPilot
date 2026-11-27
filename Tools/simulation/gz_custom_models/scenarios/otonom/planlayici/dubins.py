@@ -8,6 +8,7 @@ import math
 from dataclasses import dataclass
 
 TWO_PI = 2.0 * math.pi
+SIGN = {'L': 1, 'R': -1, 'S': 0}   # parça türü → eğrilik işareti: sola yay +1, sağa yay -1, düz 0
 
 
 def _mod(a):
@@ -56,25 +57,16 @@ class DubinsYol:
         for part in self.parts:
             n = max(1, int(math.ceil(part.length / step_m)))
             ds = part.length / n
-            sign = {'L': 1, 'R': -1, 'S': 0}[part.kind]
+            sign = SIGN[part.kind]
             for _ in range(n):
-                x, y, th = _advance(x, y, th, sign, ds, self.radius)
+                x, y, th = advance(x, y, th, sign, ds, self.radius)
                 s_total += ds
                 out.append((s_total, x, y, theta_to_course(th), sign))
         return out
 
-    def tangent_points(self):
-        """Parça sınırlarındaki pozlar (başlangıç, ara geçişler, bitiş)."""
-        x, y, th = self.start.x, self.start.y, course_to_theta(self.start.course_deg)
-        pts = [Poz(x, y, theta_to_course(th))]
-        for part in self.parts:
-            sign = {'L': 1, 'R': -1, 'S': 0}[part.kind]
-            x, y, th = _advance(x, y, th, sign, part.length, self.radius)
-            pts.append(Poz(x, y, theta_to_course(th)))
-        return pts
 
-
-def _advance(x, y, th, sign, ds, r):
+def advance(x, y, th, sign, ds, r):
+    """(x, y, th) pozundan sign yönünde (SIGN) r yarıçapla ds yol ilerle."""
     if sign == 0:
         return x + ds * math.cos(th), y + ds * math.sin(th), th
     dth = sign * ds / r

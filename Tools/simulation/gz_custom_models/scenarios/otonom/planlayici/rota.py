@@ -11,8 +11,8 @@ import math
 from dataclasses import dataclass, field
 
 from . import dubins as D
+from .geo import M_PER_DEG
 
-EARTH_M_PER_DEG = 111320.0
 
 
 class YerelCerceve:
@@ -20,13 +20,13 @@ class YerelCerceve:
 
     def __init__(self, lat0, lon0):
         self.lat0, self.lon0 = lat0, lon0
-        self.kx = EARTH_M_PER_DEG * math.cos(math.radians(lat0))
+        self.kx = M_PER_DEG * math.cos(math.radians(lat0))
 
     def xy(self, lat, lon):
-        return (lon - self.lon0) * self.kx, (lat - self.lat0) * EARTH_M_PER_DEG
+        return (lon - self.lon0) * self.kx, (lat - self.lat0) * M_PER_DEG
 
     def latlon(self, x, y):
-        return self.lat0 + y / EARTH_M_PER_DEG, self.lon0 + x / self.kx
+        return self.lat0 + y / M_PER_DEG, self.lon0 + x / self.kx
 
 
 class OnbellekliArazi:
@@ -37,7 +37,7 @@ class OnbellekliArazi:
         self.cache = {}
 
     def __call__(self, lat, lon):
-        key = (round(lat * EARTH_M_PER_DEG / self.cell), round(lon * EARTH_M_PER_DEG * math.cos(math.radians(lat)) / self.cell))
+        key = (round(lat * M_PER_DEG / self.cell), round(lon * M_PER_DEG * math.cos(math.radians(lat)) / self.cell))
         if key not in self.cache:
             try:
                 self.cache[key] = self.fn(lat, lon)
@@ -99,19 +99,19 @@ def feasible_altitude_change(length, start_alt, end_alt, a):
     return need <= length + 1e-6, need
 
 
-def terrain_max(terrain, frame, x, y, course_deg, a):
-    """Yol noktası ve iki yanındaki koridor noktalarında en yüksek arazi; veri yoksa None."""
+def corridor_max(terrain, frame, x, y, course_deg, width, step):
+    """Yol noktası ve iki yanında width'e kadar (step aralıkla) en yüksek arazi; veri yoksa None."""
     th = D.course_to_theta(course_deg)
     nx, ny = -math.sin(th), math.cos(th)   # sola dik
-    heights = []
-    n = max(1, int(math.ceil(a.corridor_m / a.corridor_step_m)))
-    for off in [a.corridor_m * k / n for k in range(-n, n + 1)]:
-        lat, lon = frame.latlon(x + nx * off, y + ny * off)
-        h = terrain(lat, lon)
+    n = max(1, int(math.ceil(width / step)))
+    best = -math.inf
+    for k in range(-n, n + 1):
+        off = width * k / n
+        h = terrain(*frame.latlon(x + nx * off, y + ny * off))
         if h is None:
             return None
-        heights.append(h)
-    return max(heights)
+        best = max(best, h)
+    return best
 
 
 def loiter_clear(terrain, frame, x, y, alt_amsl, a):
@@ -141,7 +141,7 @@ def plan_leg(start, end, terrain, a=PlanAyar(), require_loiter=True):
         samples, worst, failed = [], float('inf'), None
         for s, x, y, course, _ in path.sample(a.sample_m):
             alt = altitude_at(s, path.length, start.alt_amsl, end.alt_amsl, a)
-            hmax = terrain_max(terrain, frame, x, y, course, a)
+            hmax = corridor_max(terrain, frame, x, y, course, a.corridor_m, a.corridor_step_m)
             lat, lon = frame.latlon(x, y)
             if hmax is None:
                 failed = f'{path.word}: {s:.0f} m\'de arazi verisi yok'
@@ -169,7 +169,7 @@ def mission_points(leg, frame, start, end, a):
     s_acc = 0.0
     x, y, th = path.start.x, path.start.y, D.course_to_theta(path.start.course_deg)
     for part in path.parts:
-        sign = {'L': 1, 'R': -1, 'S': 0}[part.kind]
+        sign = D.SIGN[part.kind]
         if sign != 0:
             sweep = math.degrees(part.length / path.radius)
             n = max(1, int(math.ceil(sweep / a.arc_point_deg)))
@@ -177,7 +177,7 @@ def mission_points(leg, frame, start, end, a):
             n = 1
         ds = part.length / n
         for k in range(n):
-            x, y, th = D._advance(x, y, th, sign, ds, path.radius)
+            x, y, th = D.advance(x, y, th, sign, ds, path.radius)
             s_acc += ds
             lat, lon = frame.latlon(x, y)
             alt = altitude_at(s_acc, path.length, start.alt_amsl, end.alt_amsl, a)

@@ -23,9 +23,11 @@ import math
 import re
 from dataclasses import dataclass, field
 
+from . import rota as R
+
 __all__ = ['MAV_CMD_USER_1', 'MAV_CMD_DO_GO_AROUND', 'ASAMALAR', 'SuAlmaAyar', 'SuMesaji', 'su_alma_maddeleri',
            'su_alma_kapat', 'statustext_coz', 'asama_adi', 'iptal_karari', 'izleyici_iptal', 'bitti_kabul',
-           'HizSiniri', 'KABUL_PARAMS', 'hiz_siniri_px4', 'hiz_kabul']
+           'HizSiniri', 'KABUL_PARAMS', 'hiz_siniri_px4', 'hiz_kabul', 'pencere_kabul']
 
 MAV_CMD_USER_1 = 31010
 MAV_CMD_DO_GO_AROUND = 191
@@ -36,7 +38,6 @@ MAV_FRAME_MISSION = 2
 ASAMALAR = {0: 'KAPALI', 1: 'YAKLASMA', 2: 'KAPI_GECTI', 3: 'FLARE', 4: 'DEGME', 5: 'SUALMA', 6: 'KALKIS', 7: 'BITTI',
             8: 'IPTAL'}
 SUDA = ('FLARE', 'DEGME', 'SUALMA')           # su yüzeyine yakın aşamalar: izleyici bunlarda denetler
-IPTAL_NEDENLERI = ('OPERATOR', 'KAPI', 'HIZ_DUSUK', 'YATIS', 'YAN_SAPMA', 'RADAR', 'BANT')
 # Yeniden denemenin işe yarayabileceği nedenler: hizalanma ve hız. RADAR ölçüm arızasıdır, yeniden denenmez.
 # OPERATOR: iptali biz (izleyici) ya da yer istasyonu verdi; izleyicinin nedeni ayrıca bilinir (iptal_karari'na verilir).
 YENIDEN_DENENIR = ('KAPI', 'HIZ_DUSUK', 'YATIS', 'YAN_SAPMA', 'BANT')
@@ -50,8 +51,8 @@ class SuAlmaAyar:
     sure_min_s: float = 8.0
     sure_max_s: float = 12.0
     deneme_en_cok: int = 3                  # bugünkü offboard hizalanma ile aynı
-    yaklasma_ustu_m: float = 100.0          # su_gecisi giriş irtifası (water_leg.APPROACH_ABOVE_WATER_M)
-    tirmanis_ustu_m: float = 150.0          # water_leg.CLIMB_ABOVE_WATER_M
+    yaklasma_ustu_m: float = 100.0          # su üstü yaklaşma ve su_gecisi giriş irtifası
+    tirmanis_ustu_m: float = 150.0          # su alma sonrası tırmanış (su üstü)
     # izleyici
     su_onde_m: float = 300.0                # su aşamalarında uçağın bu kadar önü su olmalı
     telemetri_en_cok_s: float = 2.5         # SU_ASAMA 2 Hz; bundan uzun sessizlik su aşamasında iptal
@@ -72,10 +73,7 @@ class HizSiniri:
 
 def hiz_siniri_px4(read_param):
     """read_param(ad) -> değer ya da None. Okunamayan parametre varsa RuntimeError: kabul sessizce varsayılana düşmesin."""
-    values = {name: read_param(name) for name in KABUL_PARAMS}
-    missing = [name for name, value in values.items() if value is None]
-    if missing:
-        raise RuntimeError(f'su alma sınırları PX4\'ten okunamadı: {", ".join(missing)}')
+    values = R.read_px4_params(read_param, KABUL_PARAMS)
     return HizSiniri(*(float(values[name]) for name in KABUL_PARAMS))
 
 
@@ -190,20 +188,26 @@ def izleyici_iptal(asama, asama_suresi_s, telemetri_yasi_s, su_onde, ayar=SuAlma
     return None
 
 
+def pencere_kabul(scoop_s, disarida_s, siniri, ayar=SuAlmaAyar()):
+    """Su alma penceresinin kabul ölçütü: sorunların listesi, boşsa kabul. scoop_s pencere süresi (None: pencere
+    tamamlanmadı), disarida_s iptal bandı dışında geçen toplam süre. İki su alma yolu ve PX4 raporu aynı ölçütü kullanır."""
+    if scoop_s is None:
+        return ['su alma penceresi tamamlanmadı']
+    sorun = []
+    if not ayar.sure_min_s <= scoop_s <= ayar.sure_max_s:
+        sorun.append(f'pencere {scoop_s:.1f} s, şart {ayar.sure_min_s:.0f}-{ayar.sure_max_s:.0f} s')
+    ok, why = hiz_kabul(disarida_s, siniri)
+    if not ok:
+        sorun.append(why)
+    return sorun
+
+
 def bitti_kabul(mesaj, siniri, ayar=SuAlmaAyar()):
     """PX4 BITTI raporu kabul ölçütünü tutuyor mu: (bool, açıklama). Karşılaştırma içindir; asıl karar Gazebo ölçümü.
-    siniri: HizSiniri (PX4 parametreleri). Süre sure_min_s-sure_max_s, iptal bandı dışı süre (a) en çok FW_SC_OOB_T."""
+    siniri: HizSiniri (PX4 parametreleri). Ölçüt pencere_kabul; iptal bandı dışı süre raporun a= alanı."""
     d = mesaj.degerler
-    eksik = [k for k in ('sure', 'vmin', 'vmax') if k not in d]
+    eksik = [k for k in ('sure', 'vmin', 'vmax', 'iptal_disi') if k not in d]
     if eksik:
-        return False, f'raporda eksik: {", ".join(eksik)}'
-    sorun = []
-    if not ayar.sure_min_s <= d['sure'] <= ayar.sure_max_s:
-        sorun.append(f"süre {d['sure']:.1f} s")
-    if 'iptal_disi' not in d:
-        sorun.append('iptal bandı dışı süre raporda yok (STATUSTEXT 50 karakterde kesilmiş olabilir)')
-    else:
-        ok, why = hiz_kabul(d['iptal_disi'], siniri)
-        if not ok:
-            sorun.append(why)
+        return False, f'raporda eksik: {", ".join(eksik)} (STATUSTEXT 50 karakterde kesilmiş olabilir)'
+    sorun = pencere_kabul(d['sure'], d['iptal_disi'], siniri, ayar)
     return not sorun, '; '.join(sorun) or 'kabul'
