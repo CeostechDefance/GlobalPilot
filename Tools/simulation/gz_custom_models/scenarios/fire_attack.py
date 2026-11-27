@@ -35,7 +35,10 @@ from otonom.planlayici import rota as R, su_gecisi as SG, pist as PL, birakma as
 M = mavutil.mavlink
 # Per world: runway heading, where the search goes, and the fire's true position (only for scoring the drop).
 SITES = {
-    'antalya': dict(runway_heading=6.27, land_rel=-0.42, search=(36.9892, 30.6708), fire=(36.9759, 30.6779)),
+    # 18C/36C, kalkış 36C'den kuzeye. runway_end: pistin kuzey başı (gz_geo_terrain regions/antalya.json, OpenStreetMap yolu
+    # 14326534); planlayıcı iki iniş yönünden (36C, 18C) yolu kısa olanı seçer (kullanıcı 2026-11-27).
+    'antalya': dict(runway_heading=6.27, land_rel=-0.42, search=(36.9892, 30.6708), fire=(36.9759, 30.6779),
+                    runway_end=(36.915444, 30.7947368), designators=('36C', '18C')),
     # Runway 19, from its north end. 300 m'ye çıkınca doğrudan arama noktasına; tepeler yangını kuzeyden kısmen gizler,
     # görülmezse tarama bacakları arar.
     # land_rel: the runway surface at the landing point against the takeoff point, from the installed world.
