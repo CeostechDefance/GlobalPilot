@@ -51,7 +51,3 @@ def test_sabit_acida_hizli_alcalista_gaz_artar():
 
 def test_hiz_korumasi_burnu_en_cok_iki_derece_indirir():
     assert abs(sabit(airspeed=15.0)[0] - 4.0) < 1e-6
-
-
-def test_varsayilan_yasa3():
-    assert r.Ayar().water_touch_law in ('yasa3', os.environ.get('GASI_WATER_LAW', 'yasa3'))

@@ -72,8 +72,9 @@ def test_throttle_not_cut_on_water():
     assert thr > 0.3
 
 
-def test_default_law_unchanged():
-    assert r.Ayar().water_touch_law in ('yasa3', __import__('os').environ.get('GASI_WATER_LAW', 'yasa3'))
+def test_default_law_is_yasa6():
+    """Kullanıcı kararı 2026-11-27: varsayılan yasa 6; tahmin oturmadan Vs kütleden."""
+    assert r.Ayar().water_touch_law == __import__('os').environ.get('GASI_WATER_LAW', 'yasa6')
     k = r.Kontrol()
     assert r.vs_of(k, 800.0) == r.stall_speed(800.0)
 

@@ -13,7 +13,7 @@ uçak SolidWorks STEP montajından üretilir ve gerçek arazili dünyalarda uça
 
 | Konu | Yer |
 |---|---|
-| İniş flare yasaları 3–6 (`FW_LND_FL_LAW`; 6: kütleden bağımsız, pist ve su için yüzey profilli) | `src/modules/fw_mode_manager`, `src/modules/fw_lateral_longitudinal_control`, `src/lib/fw_performance_model` |
+| İniş flare yasaları 3–6 (`FW_LND_FL_LAW`; airframe 4022'de varsayılan 6: kütleden bağımsız, pist ve su için yüzey profilli) | `src/modules/fw_mode_manager`, `src/modules/fw_lateral_longitudinal_control`, `src/lib/fw_performance_model` |
 | PX4 içinde su alma: yaklaşma, kapı kontrolü, flare, değme, hız bandında su alma, kalkış ve iptal (`FW_SC_*`) | `src/modules/fw_mode_manager` |
 | Su alma görev maddesi `MAV_CMD_USER_1` | `src/modules/navigator`, `src/modules/mavlink/mavlink_mission.cpp` |
 | Gazebo eklentileri: iniş takımı sırası, burun tekeri yönlendirme, tekerlek freni | `src/modules/simulation/gz_plugins` |

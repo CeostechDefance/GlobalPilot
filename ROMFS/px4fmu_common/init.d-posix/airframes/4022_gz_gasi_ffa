@@ -132,27 +132,36 @@ param set-default FW_PR_IMAX 0.2
 # Yaw control on the ground, through the rudder and the nose wheel.
 param set-default FW_W_EN 1
 
-# Landing: no range sensor, so the approach uses the altitude of the landing point.
+# Landing: the approach uses the altitude of the landing point (FW_LND_USETER 0); the radar only detects the law 6 touchdown.
 param set-default FW_LND_ANG 3
 param set-default FW_LND_ABORT 0
 param set-default FW_LND_USETER 0
 param set-default FW_LND_AIRSPD 35
-# Flare: autoland style (FW_LND_FL_LAW 3). The sink rate follows height linearly from the approach sink rate at 10 m
-# to 0.5 m/s at 1 m (exponential flare) and drives pitch directly through a PI, without TECS.
-# Measured with the 2026-11-08 model: empty tank touchdown 0.67-0.91 m/s, no balloon (7 flights);
-# full tank 1.15-1.21 m/s but pitch 5.5-8.6 deg and airspeed 27-28 m/s at touchdown, close to tail strike and stall.
-param set-default FW_LND_FL_LAW 3
-param set-default FW_LND_FLALT 10
+# Flare: law 6 (user decision 2026-11-27). Airliner style for an unknown weight: the 1 g stall speed is estimated on the
+# approach from the synthetic angle of attack, the approach is flown at FW_LND_VAPP_K times it and the flare throttle holds
+# an airspeed falling with height to FW_LND_VTD_K times it; pitch holds the sink rate through a PI (KP, KI) up to
+# FW_LND_FL_PMAX. No retard before touchdown, which the radar detects (dist_bottom < FW_LND_TD_RNG). The Python water
+# touchdown (rehber.py yasa6) takes FLALT (its gate), SINK and HOLD from here but keeps its own pitch gains, KP 2 / KI 1
+# (4/4 oscillated on water on 2026-11-11); the PX4 scoop (GASI_SU_PX4=1) flies KP and KI from here.
+# This set was flown with law 6 on 2026-11-11/12. Measured from the 2026-11-11 logs (2 landings): runway 0.74-0.81 m/s,
+# pitch 4.4-5.4 deg, 1.09-1.12 Vs, peak 1.9 g; water 0.47-0.76 m/s. Law 6 with law 3's KP 2 / KI 1.2 / FLALT 10 touched
+# down at 1.33 m/s and 2.65 g (2026-11-27).
+param set-default FW_LND_FL_LAW 6
+param set-default FW_LND_FLALT 15
 param set-default FW_LND_FL_SINK 0.5
 param set-default FW_LND_FL_HOLD 1
-# Pitch floor in the flare (user decision 2026-11-10, "şimdilik 3.5"): runway touchdown pitch about +5.0 deg empty / +4.5 deg full
-# instead of +1.0 deg with 0. Measured (2 flights each where valid): empty 3.0 -> +4.3 deg, -1.2 m/s, 1.06 Vs; 3.5 -> +5.0 deg,
-# -1.07 m/s, 1.05 Vs; 4.5 -> +6.0 deg, -1.25 m/s, 1.02 Vs (at the stall). Full 3.5 -> +4.5 deg, -0.71 m/s, 1.08 Vs.
+# tail strike at about 8.6 deg pitch
+param set-default FW_LND_FL_PMAX 8
+param set-default FW_LND_FL_KP 4
+param set-default FW_LND_FL_KI 4
+# Radar for dist_bottom (law 6 touchdown), as flown with law 6 on 2026-11-11/12: reading on the ground and position below
+# the centre of gravity
+param set-default EKF2_MIN_RNG 0.62
+param set-default EKF2_RNG_POS_Z 0.2
+# Law 3 (default until 2026-11-27, with FLALT 10, KP 2, KI 1.2): exponential sink rate profile, pitch directly through a PI.
+# Its pitch floor (user decision 2026-11-10, "şimdilik 3.5"; law 3 only) gave a runway touchdown pitch of about +5.0 deg
+# empty / +4.5 deg full. Measured on 2026-11-27 (4 landings): 0.95-1.33 m/s, 1.03-1.14 Vs, peak 1.9-2.4 g.
 param set-default FW_LND_FL_PMIN 3.5
-# KP/KI retuned for FW_P_TC 0.4 (2026-11-08): with KP 5 / KI 2 the faster pitch loop oscillated -7..+10 deg over water and did
-# not touch down. KP 2 / KI 1.2: runway empty 0.65-0.80 m/s, full 1.36-1.56 m/s (pitch 3-5 deg); water empty 0.61-0.66, full 0.47.
-param set-default FW_LND_FL_KP 2
-param set-default FW_LND_FL_KI 1.2
 
 param set-default CA_AIRFRAME 1
 

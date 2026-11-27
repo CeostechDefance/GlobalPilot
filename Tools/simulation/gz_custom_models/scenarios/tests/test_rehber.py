@@ -5,8 +5,9 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 from otonom import rehber as r  # noqa: E402
+from otonom.planlayici.geo import along as offset  # noqa: E402  (lat, lon, yön, ileri, sağa)
 
-A = r.Ayar()
+A = r.Ayar(water_touch_law='yasa3')   # bu dosya yasa 3'ü sınar; varsayılan yasa 6
 HAT = r.Hat(36.65, 28.79, 178.0)
 
 
@@ -15,12 +16,6 @@ def durum(**kw):
                 roll_deg=0.0, pitch_deg=0.0, mass_kg=800.0)
     base.update(kw)
     return r.Durum(**base)
-
-
-def offset(lat, lon, course_deg, along, right):
-    c, s = math.cos(math.radians(course_deg)), math.sin(math.radians(course_deg))
-    n, e = along * c - right * s, along * s + right * c
-    return lat + n / 111320.0, lon + e / (111320.0 * math.cos(math.radians(lat)))
 
 
 def test_stall_speed_matches_airframe_note():
@@ -221,5 +216,5 @@ def test_settings_from_px4():
              FW_LND_FL_KI=2.0, FW_LND_FL_TIME=1.0, FW_P_LIM_MIN=-12.0, FW_P_LIM_MAX=15.0, FW_THR_IDLE=0.0,
              FW_THR_MAX=1.0, FW_AIRSPD_MIN=37.0)
     a = r.ayar_from_px4(p)
-    assert a.fl_alt_m == a.gate_height_m == 10.0 and a.fl_kp == 5.0 and a.land_airspeed == 35.0
+    assert a.gate_height_m == 10.0 and a.fl_kp == 5.0 and a.land_airspeed == 35.0
     assert a.fl_pmin_water == A.fl_pmin_water                            # suya özgü kalır

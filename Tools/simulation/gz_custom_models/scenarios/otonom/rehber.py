@@ -9,6 +9,8 @@ import math
 import os
 from dataclasses import dataclass, field, replace
 
+from .planlayici.geo import track_errors
+
 G = 9.81
 RHO = 1.2041          # model.sdf air_density
 WING_AREA_M2 = 15.0
@@ -43,11 +45,9 @@ class Ayar:
     speed_factor_air: float = 1.3
     airspeed_min_air: float = 37.0
     speed_factor_touch: float = 1.3     # DEĞ: burun yukarı değiş ancak ~1,3·Vs'de dengelenir
-    speed_factor_guard: float = 1.2     # DEĞ'de bunun altı PAS GEÇ
-    # Suya değiş: PX4 iniş flare'i yasa 3 aynen (FixedWingModeManager.cpp 1440-1588, FW_LND_FL_LAW 3). Değerler
+    # Suya değiş, yasa 3 alanları (PX4 FW_LND_FL_LAW 3'ün kopyası; fl_sink ve fl_hold_m yasa 6'da da). Değerler
     # ayar_from_px4 ile PX4'ten; yalnız burun sınırları suya göre (önce kıç: gövde basamağı +2..+7°, kıç ~8,9°'de değer)
     land_airspeed: float = 35.0         # FW_LND_AIRSPD; yaklaşma hızı max(bu, 1,3·Vs)
-    fl_alt_m: float = 10.0              # FW_LND_FLALT: flare başlangıcı
     fl_sink: float = 0.5                # FW_LND_FL_SINK: temas alçalması
     fl_hold_m: float = 1.0              # FW_LND_FL_HOLD: bu yükseklikte ve altında hedef = fl_sink
     fl_kp: float = 5.0                  # FW_LND_FL_KP: derece / (m/s)
@@ -67,12 +67,12 @@ class Ayar:
     # n13 dolu: -0,81 m/s, 31 m/s, burun 7,5°)
     water_flare_throttle: str = 'hold'
     # Suya değiş yasası: 'yasa3' (PX4 flare yasası 3 kopyası, burun alçalmayı tutar) ya da 'yasa4' (globalpilot-79'un pist
-    # yasası 4'ün su karşılığı, 2026-11-10: burun fl_att_water'a fl_tatt_s'de gelip sabit kalır, gaz alçalmayı PI ile
+    # yasası 4'ün su karşılığı, 2026-11-10: burun fl_att_water'a 1 s'de gelip sabit kalır, gaz alçalmayı PI ile
     # tutar; FAA-H-8083-23 bölüm 6 glassy water: sabit iniş açısı, ≤0,76 m/s alçalma, suya kadar flare yok, gaz değince
-    # kesilmez). GASI_WATER_LAW yalnız deneme içindir; verilmezse yasa3.
-    water_touch_law: str = os.environ.get('GASI_WATER_LAW', 'yasa3')
+    # kesilmez) ya da 'yasa6' (pistteki yasa 6, kütleden bağımsız). Varsayılan yasa6 (kullanıcı kararı 2026-11-27, pistte
+    # de FW_LND_FL_LAW 6); GASI_WATER_LAW ile başka yasa denenebilir.
+    water_touch_law: str = os.environ.get('GASI_WATER_LAW', 'yasa6')
     fl_att_water: float = float(os.environ.get('GASI_FL_ATT_WATER', '6.0'))   # yasa4 burun (gövde basamağı 2-7° içinde)
-    fl_tatt_s: float = 4.0              # yasa4: buruna geçiş süresi
     fl_snk1: float = 0.75               # yasa4: hold yüksekliğinin üstünde alçalma (FAA ≤150 ft/dk)
     fl_hold4_m: float = 3.0             # yasa4: bunun altında alçalma fl_sink
     fl_tff: float = 0.45                # yasa4: gaz ileri besleme
@@ -80,16 +80,15 @@ class Ayar:
     fl_tki: float = 0.10                # yasa4: gaz / (m/s·s)
     fl_vmin: float = 27.7               # yasa4: 1200 kg'da hız koruması; ağırlıkla sqrt(m/1200) ölçeklenir
     fl_vmin_pitch_max: float = 2.0      # yasa4: hız korumasında burun en çok bu kadar iner
-    touch_stall_factor_law4: float = 1.0  # yasa4 PAS GEÇ hız sınırı (·Vs): denge hızı ~1,03·Vs, 1,05 her denemede kesti
+    touch_stall_factor_law4: float = 1.0  # yasa4 ve yasa6 PAS GEÇ hız sınırı (·Vs): denge hızı ~1,03·Vs, 1,05 her denemede kesti
     # Yasa 6'nın su karşılığı (globalpilot-6b, PX4 FW_LND_FL_LAW 6 ile aynı ilke, 2026-11-11): tutunma hızı kütleden değil
     # yaklaşmada sentetik hücum açısından (burun - uçuş yolu açısı) tahmin edilir; yaklaşma l6_vapp_k·Vs, flare'de burun
-    # alçalmayı PI ile tutar (fl_snk1, l6_hold_m altında fl_sink), gaz yükseklikle l6_vtd_k·Vs'ye inen hızı tutar, giriş
+    # alçalmayı PI ile tutar (fl_snk1, fl_hold_m altında fl_sink), gaz yükseklikle l6_vtd_k·Vs'ye inen hızı tutar, giriş
     # gazından başlar, en çok l6_tslw/s değişir, suya değince kesilmez. Flapsız: suya yaklaşmada flap 0 (par_y4b kayıtları).
     l6_cl0: float = 0.73                # FW_WE_CL0 (kayıtlardan, flapsız)
     l6_cla: float = 4.7                 # FW_WE_CLA, 1/rad
     l6_vapp_k: float = 1.30             # FW_LND_VAPP_K
     l6_vtd_k: float = 1.15              # suda 1,15 (pistte FW_LND_VTD_K 1,12): değme burnu ~5°; kıç konisi basamak 5-10 cm batıkken 6-7°'de değer (79)
-    l6_hold_m: float = 1.0              # FW_LND_FL_HOLD (yasa 6 denemeleri)
     l6_kp: float = 2.0                  # derece / (m/s); 4/4 ile Dalaman tam görevinde burun -1,7..+6,5° salındı (2026-11-11)
     l6_ki: float = 1.0                  # derece / (m/s·s)
     l6_tatt_s: float = 4.0              # FW_LND_FL_TATT: alçalma hedefi bu sürede giriş alçalmasından fl_snk1'e iner
@@ -99,7 +98,8 @@ class Ayar:
     l6_tki: float = 0.10                # FW_LND_FL_TKI
     l6_tslw: float = 0.10               # FW_LND_FL_TSLW: gaz değişimi / s (itki ekseni CG üstünde: ani gaz burnu düşürür)
     decel_start_height_m: float = 45.0  # ALÇAL'ın son kısmı: hava hızı buradan decel_end_height_m'ye kadar değiş hızına iner
-    decel_end_height_m: float = 15.0    # kapıdan önce biter: hız kapıda oturmuş olsun
+    decel_end_height_m: float = 15.0    # kapı (FW_LND_FLALT) 10 m iken ondan 5 m önce biterdi; 15 m ile (yasa 6 seti, 11 ve 27
+                                        # Kasım uçuşları) kapıda biter
     decel_sink_max: float = 0.6         # hız hedefin üstündeyken alçalma sınırı: alçalma hızı geri beslemesin (uçuş o2)
     decel_speed_margin: float = 1.5     # m/s: hız fazlası 0'dan bu değere çıkarken alçalma sınırı sink_max'tan decel_sink_max'a
                                         # doğrusal iner. Ani anahtar (n1) hedef dikey hızı -2,0/-0,6 arasında zıplatıp salınım yaptı
@@ -133,13 +133,12 @@ class Ayar:
     capture_track_deg: float = 5.0
     capture_roll_deg: float = 5.0
     capture_hold_s: float = 5.0
-    gate_height_m: float = 10.0         # = fl_alt_m (ayar_from_px4 eşitler): kapı flare başlangıcıdır
+    gate_height_m: float = 10.0         # FW_LND_FLALT (ayar_from_px4): kapı flare başlangıcıdır
     gate_cross_m: float = 15.0
     gate_track_deg: float = 3.0
     gate_roll_deg: float = 3.0
     gate_speed_tol: float = 2.0
     touch_roll_abort_deg: float = 5.0
-    touch_settle_s: float = 2.0         # DEĞ'e girişte yunuslama aralığa otursun
 
 
 @dataclass(frozen=True)
@@ -167,7 +166,7 @@ class Kontrol:
     """Aşamalar arası taşınan integratörler ve flare durumu. İlk değerler giriş anındaki komuttan (sarsıntısız geçiş)."""
     pitch_int: float = 0.0
     thr_int: float = 0.0
-    flare: bool = False             # yasa 3 başladı mı (PX4: _flare_states.flaring, geri dönüşsüz)
+    flare: bool = False             # flare başladı mı (PX4: _flare_states.flaring, geri dönüşsüz)
     fl_start_h: float = 0.0
     fl_start_sink: float = 0.0
     fl_start_pitch: float = 0.0
@@ -200,11 +199,7 @@ class Komut:
 
 def line_errors(d, hat):
     """(boyuna ilerleme, yan sapma sağa +, yön hatası) m, m, derece. Küçük alan için düz yer yaklaşımı."""
-    n = (d.lat - hat.lat) * 111320.0
-    e = (d.lon - hat.lon) * 111320.0 * math.cos(math.radians(hat.lat))
-    c, s = math.cos(math.radians(hat.course_deg)), math.sin(math.radians(hat.course_deg))
-    along = n * c + e * s
-    cross = -n * s + e * c
+    along, cross = track_errors(d.lat, d.lon, (hat.lat, hat.lon), hat.course_deg)
     return along, cross, wrap_deg(d.course_deg - hat.course_deg)
 
 
@@ -303,7 +298,7 @@ def throttle(d, speed_sp, climb_sp, k, dt, a=Ayar()):
 
 
 def flare_law3(d, k, dt, a=Ayar()):
-    """PX4 iniş flare'i, yasa 3 (FixedWingModeManager.cpp 1440-1588) aynen; h = gövde altının su üstü yüksekliği.
+    """PX4 iniş flare'i yasa 3'ün kopyası; h = gövde altının su üstü yüksekliği.
     Dönüş: (yunuslama°, hedef dikey hız (yukarı +), gaz üst sınırı, yeni Kontrol)."""
     if not k.flare:
         # flare başlangıcı: geri dönüşsüz; başlangıç alçalması, yüksekliği ve burun açısı saklanır
@@ -395,7 +390,7 @@ def flare_law6_water(d, k, dt, a=Ayar()):
         k = replace(k, flare=True, fl_start_h=d.height, fl_start_sink=-d.climb, fl_start_pitch=d.pitch_deg, fl_int=0.0,
                     fl_t=0.0, fl_v0=d.airspeed, fl_thr0=thr0, fl_thr=thr0, fl_tint=0.0, fl_pcmd=d.pitch_deg)
     t = k.fl_t + dt
-    hold = a.l6_hold_m
+    hold = a.fl_hold_m
     trans = max(0.0, min(1.0, t / max(a.l6_tatt_s, 0.1)))
     sink = trans * (a.fl_snk1 if d.height > hold else a.fl_sink) + (1.0 - trans) * max(k.fl_start_sink, 0.0)
     f = max(0.0, min(1.0, (d.height - hold) / max(k.fl_start_h - hold, 0.1)))   # 1 flare başı, 0 hold altı
@@ -493,9 +488,9 @@ def gate_ok(d, hat, a=Ayar(), k=None):
 
 
 def touch_abort(d, time_in_phase, a=Ayar(), k=None):
-    """DEĞ (yasa 3 flare) sırasında PAS GEÇ gerekçesi ya da None. Yükseklik 1 m altına inince artık geri dönülmez.
-    Burun sınırlarını yasa uygular (flare başında P_LIM_MIN, hold yüksekliğinde suya özgü FL_PMIN): burada yalnız
-    yatış ve tutunma kaybı yakınlığı denetlenir (gaz flare'de rölantide, hız düşer)."""
+    """DEĞ (flare) sırasında PAS GEÇ gerekçesi ya da None. Yükseklik 1 m altına inince artık geri dönülmez.
+    Burun sınırlarını yasa uygular: burada yalnız yatış ve tutunma kaybı yakınlığı denetlenir (yasa 3'te gaz flare'de
+    rölantide, hız düşer)."""
     if d.height <= 1.0:
         return None
     if abs(d.roll_deg) > a.touch_roll_abort_deg:
@@ -515,8 +510,8 @@ def ayar_from_px4(params, base=None):
     """Rehber ayarlarını PX4'ün iniş parametrelerinden alır (suya değiş pistteki flare ile aynı olsun).
     Su için yalnız burun sınırları (fl_pmin_water/fl_pmax_water) değişmez: gövde basamağından."""
     a = base or Ayar()
-    return replace(a, land_airspeed=float(params['FW_LND_AIRSPD']), fl_alt_m=float(params['FW_LND_FLALT']),
-                   gate_height_m=float(params['FW_LND_FLALT']), fl_sink=float(params['FW_LND_FL_SINK']),
+    return replace(a, land_airspeed=float(params['FW_LND_AIRSPD']), gate_height_m=float(params['FW_LND_FLALT']),
+                   fl_sink=float(params['FW_LND_FL_SINK']),
                    fl_hold_m=float(params['FW_LND_FL_HOLD']), fl_kp=float(params['FW_LND_FL_KP']),
                    fl_ki=float(params['FW_LND_FL_KI']), fl_time_s=float(params['FW_LND_FL_TIME']),
                    p_lim_min=float(params['FW_P_LIM_MIN']), p_lim_max=float(params['FW_P_LIM_MAX']),
