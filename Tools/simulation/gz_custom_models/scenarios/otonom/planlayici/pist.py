@@ -4,13 +4,26 @@ Kural: uçak piste hangi yönden inmek daha kısa yol tutuyorsa o yönden iner; 
 Desen uçağın bulunduğu yerden çizilir:
 - düz giriş: uçak son yaklaşma çizgisine az bir açıyla geliyorsa doğrudan son yaklaşma başına,
 - taban girişi: değilse uçağın bulunduğu yandaki (ya da öbür yandaki) taban noktasına, oradan son yaklaşmaya.
-Her aday için yol uzunluğu ilk dönüşün yayıyla birlikte hesaplanır; arazi payı tutmayan aday elenir.
-Hiçbir aday tutmazsa ``None`` döner, çağıran eski deseni kullanır.
+Arazi payı tutmayan aday elenir. Hiçbir aday tutmazsa desen boş döner (ok False), çağıran eski deseni kullanır.
+
+İlk dönüş (2026-11-27): uçağın yönü verilirse (course_deg) bulunduğu yerden desenin ilk noktasına (taban noktası ya da
+son yaklaşma başı) giden yol Dubins yoludur ve PX4'ün uçacağı gibi denetlenir. 2026-11-27 gösterisinde yalnız düz çizgi
+denetlenmişti; uçak ~180° dönüşte kısa yönü (sağ) seçti ve denetlenmeyen sırta çarptı.
+- Yay noktaları göreve yazılır (transition): PX4 dönüşü planlanan yönde yapar.
+- Arazi yolun iki yanında koridorla (corridor_m) örneklenir: PX4 noktaya accept_m kala sonrakine geçer ve köşeleri keser.
+  Başlangıç bir görev noktasıysa (early_m) dönüş o kadar erken de başlayabilir: erken başlayan aynı yönlü yol da denetlenir.
+- İrtifa ilk yay boyunca korunur (start_rel_m), sonra geç alçalış. Denetimde PX4'ün irtifa davranışı kullanılır: iki nokta
+  arası doğrusal ve sonraki noktanın irtifasına ona accept_m kala varılır; noktalar accept_m'den yakınsa doğrudan
+  sonrakinin irtifası istenir. Uçak en çok climb_gradient ile tırmanır, en çok sink_max_gradient ile alçalır (en kötü durum).
+Desenin geri kalanı (taban → son yaklaşma → iniş) düz bacaklarla denetlenir.
 
 Arazi bir fonksiyondur: terrain(lat, lon) -> m (deniz seviyesine göre) ya da None. Simülasyon ya da MAVLink bilmez.
 """
 import math
 from dataclasses import dataclass, field
+
+from . import dubins as D
+from . import rota as R
 
 __all__ = ['PistAyar', 'PistYonu', 'PistDeseni', 'plan_runway_return']
 
@@ -54,6 +67,31 @@ class PistAyar:
     glide_margin_m: float = 15.0        # süzülüşte yerden en az bu kadar (iniş noktasına glide_check_end_m kalana dek)
     glide_check_end_m: float = 1000.0   # süzülüşün son bu kadarı (pist yaklaşma alanı) denetlenmez
     step_m: float = 100.0               # arazi örnek aralığı
+    # İlk dönüş (Dubins). Yarıçap = airspeed ve bank_deg'den, radius_margin ile (rota.PlanAyar ile aynı yöntem).
+    airspeed: float = 45.0              # dönüş hızı; boş uçakta PX4 hızları ağırlıkla küçültür (800 kg: ~37 m/s)
+    bank_deg: float = 25.0              # FW_R_LIM
+    radius_margin: float = 1.25
+    accept_m: float = 440.0             # NAV_ACC_RAD: PX4 noktaya bu kadar kala sonrakine geçer
+    corridor_m: float = 500.0           # NAV_ACC_RAD + 60: uçulan yol Dubins yolundan en çok 451 m saptı (uçuş p1)
+    corridor_step_m: float = 30.0       # arazi ızgarası ~30 m: daha seyrek örnek dar tepeyi kaçırır
+    sample_m: float = 30.0              # yol boyunca örnek aralığı, aynı nedenle
+    climb_gradient: float = 3.45 / 45.0     # ölçülen seyir tırmanışı (m/m)
+    descent_gradient: float = 2.0 / 45.0    # FW_T_SINK_R_SP / hız: planlanan geç alçalışın eğimi
+    sink_max_gradient: float = 5.0 / 37.0   # FW_T_SINK_MAX / boş uçak hızı: PX4'ün en hızlı alçalışı (denetimde en kötü)
+    descent_max_gradient: float = 4.0 / 37.0  # planlanan alçalışın en diki: uçak noktaların irtifasına yetişsin
+    alt_accept_m: float = 10.0          # NAV_FW_ALT_RAD: PX4 noktayı irtifa farkı bundan büyükken bırakmaz, orada döner
+                                        # (2026-11-27 test 2: 300 m istenen ilk yay noktasına ~100 m'de varan uçak çember attı)
+    arc_point_deg: float = 60.0         # dönüş yayında bu açıdan bir görev noktası
+    # Denizden alçak başlayan dönüş (su bölümünden sonra): kalkış gibi, pay ve koridor dar başlar, uzaklıkla büyür
+    # (arazi_rota.RotaAyar ile aynı kural). Yalnız başlangıç denizdeyse ve uçak istenen irtifanın altındaysa.
+    sea_max_m: float = 5.0              # bunun altı deniz (LAND_MIN_AMSL_M)
+    climbout_margin_m: float = 10.0     # başlangıçta pay; yol boyunca tırmanış eğiminin yarısıyla margin_m'ye büyür
+    climbout_corridor_m: float = 60.0   # başlangıçta koridor yarı genişliği; climbout_corridor_slope ile corridor_m'ye
+    climbout_corridor_slope: float = 0.3
+
+    @property
+    def radius(self):
+        return D.turn_radius(self.airspeed, self.bank_deg) * self.radius_margin
 
 
 @dataclass(frozen=True)
@@ -72,6 +110,9 @@ class PistDeseni:
     length_m: float
     points: list = field(default_factory=list)   # [(ad, (lat, lon), göreli yükseklik)], iniş noktası en sonda
     rejected: list = field(default_factory=list)  # [(aday, gerekçe)]
+    transition: list = field(default_factory=list)  # ilk dönüşün görev noktaları, points'ten önce: [(ad, (lat, lon), göreli)]
+    turn: str = None                    # ilk dönüşün yönü: 'sola' | 'sağa' | None (dönüş yok ya da yön verilmedi)
+    min_clearance_m: float = None       # ilk dönüşte (koridorla) en az arazi payı
 
     @property
     def ok(self):
@@ -97,7 +138,193 @@ def _leg_clear(terrain, home_amsl, a, b, alt_a, alt_b, ayar, margin=None, end_sk
     return True, None
 
 
+def _first_turn(path):
+    kind = next((p.kind for p in path.parts if p.kind != 'S'), None)
+    return {'L': 'sola', 'R': 'sağa'}.get(kind)
+
+
+def _profile(path, actual, hold, end, ayar):
+    """Görev noktalarının irtifası (deniz seviyesine göre) yol boyunca; uçağın yetişebileceği biçimde, çünkü PX4 noktayı
+    irtifa farkı alt_accept_m'den büyükken bırakmaz. Dönüş: (irtifa(s), alçalış başı s ya da None, gerekçe ya da None).
+    Uçağın gerçek irtifasından (actual) climb_gradient ile hold'a tırmanış; ilk yay boyunca alçalış yok; sonra end'e geç
+    alçalış (descent_gradient; yol yetmezse descent_max_gradient'e kadar dik). Sığmazsa irtifa None, gerekçe dolu."""
+    length = path.length
+    top_alt = max(hold, end, actual)
+
+    def top(s):
+        return min(top_alt, actual + ayar.climb_gradient * s)
+    if top(length) < end - 1e-6:
+        return None, None, f'tırmanış yetişmiyor: sonda {end - top(length):.0f} m eksik'
+    if end >= top_alt - 1e-6:
+        return top, None, None
+    first_arc = min(length, path.parts[0].length) if path.parts and path.parts[0].kind != 'S' else 0.0
+    rest = length - first_arc
+    need = (top(first_arc) - end) / rest if rest > 1e-6 else math.inf
+    gradient = max(ayar.descent_gradient, need)
+    if gradient > ayar.descent_max_gradient + 1e-9:
+        return None, None, f'alçalış sığmıyor: {top(first_arc) - end:.0f} m için {rest:.0f} m yol'
+
+    def profile(s):
+        return min(top(s), end + gradient * (length - s))
+    # alçalış başı: tırmanış/tutma çizgisinin alçalış çizgisiyle kesiştiği yer
+    s_flat = (top_alt - actual) / ayar.climb_gradient if top_alt > actual else 0.0
+    s_d = length - (top_alt - end) / gradient
+    if s_d < s_flat:
+        s_d = (end + gradient * length - actual) / (ayar.climb_gradient + gradient)
+    return profile, max(first_arc, s_d), None
+
+
+def _waypoints(path, profile, s_d, ayar):
+    """Görev noktaları (s, x, y, irtifa): yaylarda en çok arc_point_deg aralıkla, parça sonlarında, düz parçada alçalış
+    başında. Son nokta yolun sonudur (desenin ilk noktası)."""
+    pts = []
+    x, y, th = path.start.x, path.start.y, D.course_to_theta(path.start.course_deg)
+    s0 = 0.0
+    for part in path.parts:
+        sign = {'L': 1, 'R': -1, 'S': 0}[part.kind]
+        if sign:
+            n = max(1, int(math.ceil(math.degrees(part.length / path.radius) / ayar.arc_point_deg - 1e-9)))
+            cuts = [part.length * k / n for k in range(1, n + 1)]
+        elif s_d is not None and s0 + ayar.sample_m < s_d < s0 + part.length - ayar.sample_m:
+            cuts = [s_d - s0, part.length]
+        else:
+            cuts = [part.length]
+        done = 0.0
+        for c in cuts:
+            x, y, th = D._advance(x, y, th, sign, c - done, path.radius)
+            done = c
+            pts.append((s0 + c, x, y, profile(s0 + c), part.kind, s_d is not None and abs(s0 + c - s_d) < 1e-6))
+        s0 += part.length
+    return pts
+
+
+def _corridor_max(terrain, frame, x, y, course_deg, width, step):
+    """Yol noktası ve iki yanında width'e kadar en yüksek arazi; veri yoksa None."""
+    th = D.course_to_theta(course_deg)
+    nx, ny = -math.sin(th), math.cos(th)
+    n = max(1, int(math.ceil(width / step)))
+    best = -math.inf
+    for k in range(-n, n + 1):
+        off = width * k / n
+        h = terrain(*frame.latlon(x + nx * off, y + ny * off))
+        if h is None:
+            return None
+        best = max(best, h)
+    return best
+
+
+def _fly(path, wps, prev_amsl, actual_amsl, terrain, frame, ayar, climbout=False):
+    """PX4'ün uçacağı irtifayla yol boyunca (iki yanda koridorla) arazi payı. (ok, en az pay, gerekçe).
+    prev_amsl: başlangıçtaki (önceki) görev noktasının irtifası; actual_amsl: uçağın oradaki gerçek irtifası.
+    climbout: denizden alçak başlangıç; pay ve koridor kalkıştaki gibi dar başlar, yol boyunca büyür.
+    PX4 bir noktayı ancak yatayda accept_m'ye girince (ya da geçince) ve irtifa farkı alt_accept_m içindeyken bırakır;
+    irtifası tutmadan geçilen noktada uçak döner: bu yol kabul edilmez."""
+    k = 0
+    px, py, palt = path.start.x, path.start.y, prev_amsl
+    z, s_last, min_d = actual_amsl, 0.0, None
+    worst = math.inf
+    margin, width = ayar.margin_m, ayar.corridor_m
+    samples = path.sample(ayar.sample_m)
+    for s, x, y, course, _ in samples:
+        while k < len(wps) - 1:
+            _, cx, cy, calt = wps[k][:4]
+            near = math.hypot(x - cx, y - cy) <= ayar.accept_m
+            passed = (cx - px) * (x - cx) + (cy - py) * (y - cy) > 0.0
+            if not (near or passed):
+                break
+            if abs(z - calt) > ayar.alt_accept_m:
+                if passed:
+                    return False, worst, (f'{k + 1}. noktada irtifa farkı {calt - z:+.0f} m: PX4 noktayı bırakmaz, '
+                                          f'orada döner')
+                break
+            px, py, palt = cx, cy, calt
+            k += 1
+            min_d = None
+        _, cx, cy, calt = wps[k][:4]
+        chord = math.hypot(cx - px, cy - py)
+        if chord > ayar.accept_m:
+            # PX4 iki nokta arası (FixedwingPositionControl, irtifa birinci derece tutma): en küçük uzaklıkla doğrusal
+            d = math.hypot(x - cx, y - cy)
+            min_d = min(chord, d) if min_d is None else min(min_d, d)
+            sp = calt if min_d <= ayar.accept_m else palt + (calt - palt) * (chord - min_d) / (chord - ayar.accept_m)
+        else:
+            sp = calt
+        ds = s - s_last
+        s_last = s
+        z += max(-ayar.sink_max_gradient * ds, min(ayar.climb_gradient * ds, sp - z))
+        if climbout:
+            margin = min(ayar.margin_m, ayar.climbout_margin_m + 0.5 * ayar.climb_gradient * s)
+            width = min(ayar.corridor_m, ayar.climbout_corridor_m + ayar.climbout_corridor_slope * s)
+        h = _corridor_max(terrain, frame, x, y, course, width, ayar.corridor_step_m)
+        if h is None:
+            return False, worst, f'{s:.0f}. m\'de arazi verisi yok'
+        worst = min(worst, z - h)
+        if z - h < margin:
+            return False, worst, f'{s:.0f}. m\'de arazi {h:.0f} m, yükseklik {z:.0f} m'
+    if abs(z - wps[-1][3]) > ayar.alt_accept_m:
+        return False, worst, f'desenin ilk noktasında irtifa farkı {wps[-1][3] - z:+.0f} m: PX4 noktayı bırakmaz, orada döner'
+    return True, worst, None
+
+
+def _transition(start, course_deg, hold_amsl, actual_amsl, end, end_course, end_amsl, terrain, ayar, early_m=0.0,
+                climbout=False):
+    """Başlangıç pozundan desenin ilk noktasına (end, end_course) arazi payını tutan en kısa Dubins yolu.
+    early_m > 0: başlangıç bir görev noktasıdır, PX4 onu early_m erken bırakır; 0: başlangıç uçağın kendi konumudur.
+    Noktaların irtifası uçağın gerçek irtifasından (actual_amsl) yetişilebilir biçimde (_profile); ilk iki nokta arasında
+    PX4 irtifayı uçağın irtifasından değiştirmeye başlar (denetimde en alçak durum).
+    Dönüş: (yol, görev noktaları [(ad, (lat, lon), irtifa amsl)] (son nokta hariç), en az pay, gerekçe).
+    Yol yoksa yol None, gerekçe dolu."""
+    prev_amsl = actual_amsl
+    frame = R.YerelCerceve(*start)
+    sx, sy = frame.xy(*start)
+    ex, ey = frame.xy(*end)
+    end_pose = D.Poz(ex, ey, end_course)
+    early = {}
+    if early_m > 0.0:
+        th = D.course_to_theta(course_deg)
+        bx, by = sx - early_m * math.cos(th), sy - early_m * math.sin(th)
+        early = {p.word: p for p in D.all_paths(D.Poz(bx, by, course_deg), end_pose, ayar.radius)}
+    reasons = []
+    for path in D.all_paths(D.Poz(sx, sy, course_deg), end_pose, ayar.radius):
+        profile, s_d, why = _profile(path, actual_amsl, hold_amsl, end_amsl, ayar)
+        if profile is None:
+            reasons.append(f'{_first_turn(path) or "düz"} ({path.word}): {why}')
+            continue
+        wps = _waypoints(path, profile, s_d, ayar)
+        ok, worst, why = _fly(path, wps, prev_amsl, actual_amsl, terrain, frame, ayar, climbout)
+        if ok and early:
+            twin = early.get(path.word)
+            tprofile, ts_d, twhy = _profile(twin, actual_amsl, hold_amsl, end_amsl, ayar) if twin else (None, None, None)
+            if twin is None:
+                ok, why = False, 'erken başlayan aynı yönlü dönüş yok'
+            elif tprofile is None:
+                ok, why = False, f'{early_m:.0f} m erken dönüşte {twhy}'
+            else:
+                ok, eworst, why = _fly(twin, _waypoints(twin, tprofile, ts_d, ayar), prev_amsl, actual_amsl, terrain, frame,
+                                       ayar, climbout)
+                worst = min(worst, eworst)
+                why = f'{early_m:.0f} m erken dönüşte {why}' if why else None
+        if not ok:
+            reasons.append(f'{_first_turn(path) or "düz"} ({path.word}): {why}')
+            continue
+        names = {'L': 'sol yay', 'R': 'sağ yay'}
+        arcs = {}
+        for wp in wps[:-1]:
+            arcs[wp[4]] = arcs.get(wp[4], 0) + 1
+        seen, points = {}, []
+        for s, x, y, alt, kind, descent in wps[:-1]:
+            seen[kind] = seen.get(kind, 0) + 1
+            if kind == 'S':
+                name = 'Piste dönüş: alçalış başı' if descent else 'Piste dönüş: düz'
+            else:
+                name = f'Piste dönüş: {names[kind]} {seen[kind]}/{arcs[kind]}' + (' (alçalış başı)' if descent else '')
+            points.append((name, frame.latlon(x, y), alt))
+        return path, points, worst, None
+    return None, [], None, '; '.join(reasons[:2]) or 'aday yol yok'
+
+
 def _candidates(start, course_deg, rw, ayar):
+    """Adaylar: (ad, desen noktaları, eski yaklaşık uzunluk, ilk noktadaki yön, ilk noktadan sonraki uzunluk)."""
     land = _along(*rw.threshold, rw.heading_deg, ayar.land_along_m)
     final = _along(*rw.threshold, rw.heading_deg, -ayar.final_m)
     glide_len = (ayar.pattern_rel_m - rw.land_rel_m) / math.tan(math.radians(ayar.final_angle_deg))
@@ -112,7 +339,8 @@ def _candidates(start, course_deg, rw, ayar):
     # düz giriş: açı küçük ve son yaklaşma başı en az iki dönüş yarıçapı uzakta (yakınsa yol uçulamaz, 7b)
     if _turn(to_final, rw.heading_deg) <= ayar.straight_in_max_deg and _dist(start, final) >= 2.0 * ayar.turn_radius_m:
         turns = _turn(course_deg, to_final) + _turn(to_final, rw.heading_deg) if course_deg is not None else 0.0
-        out.append(('düz giriş', [], _dist(start, final) + final_len + ayar.turn_radius_m * math.radians(turns)))
+        out.append(('düz giriş', [], _dist(start, final) + final_len + ayar.turn_radius_m * math.radians(turns),
+                    rw.heading_deg, final_len))
     for side, label in ((1.0, 'taban (sağ)'), (-1.0, 'taban (sol)')):
         base = _along(*final, rw.heading_deg, 0.0, side * ayar.base_m)
         to_base = _bearing(start, base)
@@ -120,35 +348,89 @@ def _candidates(start, course_deg, rw, ayar):
         turns = (_turn(course_deg, to_base) if course_deg is not None else 0.0) + _turn(to_base, base_course) + \
             _turn(base_course, rw.heading_deg)
         length = _dist(start, base) + _dist(base, final) + final_len + ayar.turn_radius_m * math.radians(turns)
-        out.append((label, [('Taban bacağı', base, ayar.pattern_rel_m)], length))
-    return [(label, head + tail, length) for label, head, length in out]
+        rest = _dist(base, final) + final_len + ayar.turn_radius_m * math.radians(_turn(base_course, rw.heading_deg))
+        out.append((label, [('Taban bacağı', base, ayar.pattern_rel_m)], length, base_course, rest))
+    return [(label, head + tail, length, first_course, rest) for label, head, length, first_course, rest in out]
 
 
-def plan_runway_return(start, start_rel_m, course_deg, runways, home_amsl, terrain, ayar=PistAyar()):
+def _pattern_clear(terrain, home_amsl, points, ayar):
+    """Desenin ilk noktasından sonraki bacaklar: desen yüksekliğinde ayar.margin_m, süzülüşte glide_margin_m (son
+    glide_check_end_m hariç). (ok, gerekçe)."""
+    prev, prev_alt = points[0][1], points[0][2]
+    for pname, p, alt in points[1:]:
+        if pname == 'İniş':
+            ok, why = _leg_clear(terrain, home_amsl, prev, p, prev_alt, alt, ayar, ayar.glide_margin_m, ayar.glide_check_end_m)
+        else:
+            ok, why = _leg_clear(terrain, home_amsl, prev, p, prev_alt, alt, ayar)
+        if not ok:
+            return False, f'{pname}: {why}'
+        prev, prev_alt = p, alt
+    return True, None
+
+
+def plan_runway_return(start, start_rel_m, course_deg, runways, home_amsl, terrain, ayar=PistAyar(), actual_rel_m=None,
+                       early_m=0.0):
     """En kısa piste dönüş deseni.
 
-    start: (lat, lon) dönüşün başladığı nokta; start_rel_m: oradaki yükseklik (kalkış noktasına göre);
-    course_deg: oradaki uçuş yönü (bilinmiyorsa None, dönüş payı yalnız desen içinde sayılır);
-    runways: PistYonu listesi (aynı pistin iki yönü); home_amsl: kalkış noktasının deniz seviyesine göre yüksekliği.
+    start: (lat, lon) dönüşün başladığı nokta; start_rel_m: oradaki yükseklik (kalkış noktasına göre; ilk dönüş boyunca
+    bu yükseklik istenir); course_deg: oradaki uçuş yönü (bilinmiyorsa None: ilk bacak düz çizgi olarak denetlenir, dönüş
+    yayı yalnız uzunluğa katılır); runways: PistYonu listesi (aynı pistin iki yönü); home_amsl: kalkış noktasının deniz
+    seviyesine göre yüksekliği. actual_rel_m: uçağın başlangıçtaki gerçek yüksekliği (verilmezse start_rel_m; düşükse
+    tırmanış climb_gradient ile sınırlı sayılır). early_m: başlangıç bir görev noktasıysa PX4 onu bu kadar erken bırakır
+    (NAV_ACC_RAD); uçağın kendi konumundan planlanan dönüşte 0.
     Dönüş: PistDeseni. Hiçbir aday arazi payını tutmazsa points boş (ok False), rejected her adayın gerekçesini taşır.
     """
+    if course_deg is None:
+        return _plan_straight(start, start_rel_m, runways, home_amsl, terrain, ayar)
+    hold = home_amsl + start_rel_m
+    actual = home_amsl + (start_rel_m if actual_rel_m is None else actual_rel_m)
+    here = terrain(*start)
+    climbout = actual < hold and here is not None and here < ayar.sea_max_m   # denizden alçak başlangıç (su sonrası)
+    frame = R.YerelCerceve(*start)
+    sx, sy = frame.xy(*start)
+    cands = []
+    for rw in runways:
+        for label, points, _, first_course, rest in _candidates(start, course_deg, rw, ayar):
+            ex, ey = frame.xy(*points[0][1])
+            shortest = D.shortest(D.Poz(sx, sy, course_deg), D.Poz(ex, ey, first_course), ayar.radius).length
+            cands.append((shortest + rest, rw, label, points, first_course, rest))
+    cands.sort(key=lambda c: c[0])
+    best, rejected = None, []
+    for bound, rw, label, points, first_course, rest in cands:
+        if best is not None and bound >= best.length_m:
+            break                                         # kalan adayların en kısa yolu bile daha uzun
+        name = f'{rw.name} {label}'
+        ok, why = _pattern_clear(terrain, home_amsl, points, ayar)
+        if not ok:
+            rejected.append((name, why))
+            continue
+        path, transition, worst, why = _transition(start, course_deg, hold, actual, points[0][1], first_course,
+                                                   home_amsl + points[0][2], terrain, ayar, early_m, climbout)
+        if path is None:
+            rejected.append((name, f'{points[0][0]}: ilk dönüş {why}'))
+            continue
+        length = path.length + rest
+        if best is None or length < best.length_m:
+            best = PistDeseni(rw, label, length, points, transition=[(n, p, alt - home_amsl) for n, p, alt in transition],
+                              turn=_first_turn(path) if transition else None, min_clearance_m=worst)
+    if best is None:
+        return PistDeseni(None, None, float('inf'), [], rejected)
+    best.rejected = rejected
+    return best
+
+
+def _plan_straight(start, start_rel_m, runways, home_amsl, terrain, ayar):
+    """Yön bilinmeyen dönüş: ilk bacak düz çizgi (eski denetim), dönüş yayı yalnız uzunluğa katılır."""
     best, rejected = None, []
     for rw in runways:
-        for label, points, length in _candidates(start, course_deg, rw, ayar):
+        for label, points, length, _, _ in _candidates(start, None, rw, ayar):
             name = f'{rw.name} {label}'
             # ilk bacakta start yüksekliğinden desen yüksekliğine iniş, desen yüksekliğinde süzülüş başına kadar ayar.margin_m;
             # süzülüşte (iniş noktasına doğru) glide_margin_m, son glide_check_end_m hariç
-            prev, prev_alt, ok, why = start, start_rel_m, True, None
-            for pname, p, alt in points:
-                if pname == 'İniş':
-                    ok, why = _leg_clear(terrain, home_amsl, prev, p, prev_alt, alt, ayar, ayar.glide_margin_m,
-                                         ayar.glide_check_end_m)
-                else:
-                    ok, why = _leg_clear(terrain, home_amsl, prev, p, prev_alt, alt, ayar)
-                if not ok:
-                    why = f'{pname}: {why}'
-                    break
-                prev, prev_alt = p, alt
+            ok, why = _leg_clear(terrain, home_amsl, start, points[0][1], start_rel_m, points[0][2], ayar)
+            why = f'{points[0][0]}: {why}' if not ok else None
+            if ok:
+                ok, why = _pattern_clear(terrain, home_amsl, points, ayar)
             if not ok:
                 rejected.append((name, why))
                 continue
