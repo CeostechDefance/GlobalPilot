@@ -14,7 +14,6 @@ import argparse
 import math
 import os
 import select
-import subprocess
 import sys
 import termios
 import threading
@@ -23,7 +22,9 @@ import time
 os.environ.setdefault('GZ_IP', '127.0.0.1')
 
 import numpy as np
+from gz.msgs10.double_pb2 import Double
 from gz.msgs10.image_pb2 import Image
+from gz.msgs10.particle_emitter_pb2 import ParticleEmitter
 from gz.msgs10.pose_v_pb2 import Pose_V
 from gz.transport13 import Node
 from pymavlink import mavutil
@@ -31,6 +32,7 @@ from pymavlink import mavutil
 from fire_locator import find_fire, pixel_to_ned, ray_to_ground
 from place_wildfire import data_root_dir, ground_height  # fire_locator adds its folder to the path
 from otonom.planlayici import rota as R, su_gecisi as SG, pist as PL, birakma as PB, su_alma as SA  # noqa: E402  plan kuralları planlayıcıda (kullanıcı 2026-11-10)
+from otonom.planlayici.geo import along, bearing_deg, distance_m, track_errors  # noqa: E402
 
 M = mavutil.mavlink
 # Per world: runway heading, where the search goes, and the fire's true position (only for scoring the drop).
@@ -44,20 +46,19 @@ SITES = {
     # land_rel: the runway surface at the landing point against the takeoff point, from the installed world.
     # pattern: the descent to the pattern height ends on the downwind leg, ahead of the base turn, and the final comes in straight at final_angle, just under FW_LND_ANG.
     # search_via (denizden yaklaşma, 36.6250 28.7550) kaldırıldı (kullanıcı 2026-11-09): rota 17,7 km'den ~8 km'ye iner.
-    # runway_end: pistin öbür başı (gz_geo_terrain regions/dalaman.json); verilirse planlayıcı (otonom/planlayici/pist.py) iki
-    # iniş yönünden (19, 01) yolu kısa olanı seçer, pistin ötesinden dolaşmaz (kullanıcı 2026-11-11).
+    # runway_end: pistin öbür başı (gz_geo_terrain regions/dalaman.json), gerekli: planlayıcı (otonom/planlayici/pist.py) iki
+    # iniş yönünden yolu kısa olanı seçer, pistin ötesinden dolaşmaz (kullanıcı 2026-11-11).
     'dalaman': dict(runway_heading=195.68, land_rel=-1.54, pattern=dict(right=1500.0, base=-4500.0, rel=150.0, final_angle=2.99), search=(36.6650, 28.7980), fire=(36.66098120, 28.80584463),
                     runway_end=(36.701195, 28.788088), designators=('19', '01')),
 }
 RUNWAY_HEADING_DEG = SITES['antalya']['runway_heading']  # set from --world in main()
 LAND_REL_M = 0.0  # set from --world in main()
 PATTERN = dict(right=1200.0, base=-1800.0, rel=120.0)  # the default; set from --world in main()
-RUNWAY_DIRS = None   # [PL.PistYonu]: iki iniş yönü; main() runway_end olan dünyada kurar. None: sabit desen
+RUNWAY_DIRS = None   # [PL.PistYonu]: iki iniş yönü (kalkış yönü ve runway_end'den geri); main() kurar
 PIST_AYAR = None
 PIST_TERRAIN = None  # önbellekli arazi (planlayıcı); main() kurar
 HOME_AMSL = None
 HOME = None          # kalkış noktası (lat, lon); main() kurar
-EXIT_RETURN = None   # pist yönleri tanımsız dünyada bırakma sonrası dönüş denetimi (PB.ring_return); main() kurar
 THROTTLE_LIMIT_PARAM = 'FW_THR_MAX'
 THROTTLE_LIMIT_EXPECTED = 1.0
 # Weight (airframe WEIGHT_BASE 1200, the weight the TECS and airspeeds were tuned at). The tank mass is written to
@@ -68,7 +69,6 @@ WEIGHT_PARAM = 'WEIGHT_GROSS'
 WEIGHT_BASE_KG = 1200.0
 EMPTY_MASS_KG = 800.0
 WEIGHT_STEP_KG = 50.0
-RUN_BEARING_DEG = 315.0   # direction of the pass over the fire
 CRUISE_ABOVE_TERRAIN_M = 200.0  # above the highest ground on the route
 TAKEOFF_REL_M = 70.0      # climb and circle planning; the takeoff step itself ends at TAKEOFF_ITEM_REL_M
 # The takeoff step ends low and the mission climbs on to the next point (user, 2026-11-08; airframe FW_TKO_AIRSPD 45,
@@ -78,9 +78,8 @@ GEAR_UP_REL_M = 20.0       # gear raised by command once above this (user); a mi
 AUTO_LOITER, AUTO_MISSION = 3, 4  # PX4 custom sub modes of AUTO
 DROP_AGL_M = 100.0
 WAYPOINT_ACCEPT_M = 440.0  # NAV_ACC_RAD. PX4 ignores a mission item's own radius on fixed wing: a point that must be flown up to lies this far beyond it
+RETURN_CORRIDOR_M = WAYPOINT_ACCEPT_M + 60.0  # piste dönüş koridoru (iki yana): uçulan yol Dubins yolundan en çok 451 m saptı (uçuş p1)
 LAND_ALONG_M = 1200.0     # landing point from the runway start
-EXIT_RUN_M = 3000.0       # straight on after the drop (the planner shortens it when the turn back does not clear)
-EXIT_TURN_CLEAR_M = 500.0  # only worlds without runway_end: ground checked this far around the end of the straight run
 RETURN_ALONG_M = 4000.0   # first point of the return, from the runway start
 COMMIT_RANGE_M = 3000.0   # stop searching and turn the run towards the fire from this range
 MIN_OBSERVATIONS = 6
@@ -99,9 +98,6 @@ SEARCH_FROM_SEQ = 2       # takeoff and level leg come first in climb_items
 # landing gear function: +1 up, -1 down. A command without a position must use the mission frame.
 MAV_CMD_DO_SET_ACTUATOR = 187  # not named in the installed pymavlink dialect
 GEAR_DOWN_MAX_WHEEL_Z = -0.6   # left wheel: down -0.69, up about -0.31
-# Düz uçuş bacağı yalnız CLIMB_REL_M'ye çıkacak kadar (kullanıcı 2026-11-09: 300 m'den sonra düz uçuşa gerek yok,
-# doğrudan aleve yönelsin). Önceden 8 km'ydi. Yol: tırmanış süresi × seyir hızı + kalkış koşusu payı.
-LEVEL_END_M = None  # aşağıda CLIMB_RATE_MPS ve CRUISE_SPEED_MPS tanımlandıktan sonra hesaplanır
 WATER_LEG_RETURN_MIN_AMSL_M = 30.0  # below this after a failed water leg the aircraft is still on the sea
 ROUTE_STEP_M = 100.0
 ROUTE_MIN_MARGIN_M = 50.0
@@ -109,13 +105,16 @@ LAND_MIN_AMSL_M = 5.0
 CIRCLE_RADIUS_M = 500.0   # wider than the 25 degree bank needs at 45 m/s (443 m)
 CLIMB_RATE_MPS = 3.45     # measured in the scenario's own cruise climb
 CRUISE_SPEED_MPS = 45.0
+# Düz uçuş bacağı yalnız CLIMB_REL_M'ye çıkacak kadar (kullanıcı 2026-11-09: 300 m'den sonra düz uçuşa gerek yok,
+# doğrudan aleve yönelsin). Önceden 8 km'ydi. Yol: tırmanış süresi × seyir hızı + kalkış koşusu payı.
 LEVEL_END_M = CLIMB_REL_M / CLIMB_RATE_MPS * CRUISE_SPEED_MPS + 300.0  # ~4,2 km (300 m kalkış koşusu payı)
+RETURN_MIN_REL_M = 300.0  # piste dönüşün ilk dönüşünde istenen en az yükseklik (eve göre)
 # Boş uçağın hızı: PX4 trim hızını ağırlıkla küçültür (800 kg: ~37 m/s). Piste dönüşte dönüş yarıçapı buradan.
 EMPTY_SPEED_MPS = CRUISE_SPEED_MPS * math.sqrt(EMPTY_MASS_KG / WEIGHT_BASE_KG)
 # Su bırakma geçişi, düz çıkış ve dönüş kuralları planlayıcıda: otonom/planlayici/birakma.py (2026-11-27).
 BIRAKMA_AYAR = PB.BirakmaAyar(commit_range_m=COMMIT_RANGE_M, accept_m=WAYPOINT_ACCEPT_M, margin_m=ROUTE_MIN_MARGIN_M,
                               step_m=ROUTE_STEP_M, climb_gradient=CLIMB_RATE_MPS / CRUISE_SPEED_MPS,
-                              exit_runs_m=(EXIT_RUN_M, 2500.0, 2000.0, 1500.0, 1000.0))
+                              safe_above_m=CRUISE_ABOVE_TERRAIN_M, safe_width_m=RETURN_CORRIDOR_M)
 CAMERA_TOPIC = '/world/{world}/model/gasi_ffa_0/link/base_link/sensor/fire_camera/image'
 WATER_CMD = '/model/gasi_ffa_0/link/base_link/particle_emitter/water/cmd'
 FIRE_CMD = '/model/wildfire/link/fire_link/particle_emitter/{}/cmd'
@@ -124,19 +123,6 @@ WATER_RELEASE = '/model/gasi_ffa_0/water/release'
 # noktada, su küçükse karada çemberde alçalış). Burada sayı tutulmaz.
 SU_GECIS_AYAR = SG.SuGecisAyar(accept_m=WAYPOINT_ACCEPT_M, circle_radius_m=CIRCLE_RADIUS_M)
 WATER_RELEASE_KGS = 270.0  # 400 kg ~1,48 s'de: RELEASE_S (1,5 s) içinde tank boşalır
-
-
-def offset(lat, lon, north, east):
-    return lat + north / 111320.0, lon + east / (111320.0 * math.cos(math.radians(lat)))
-
-
-def along(lat, lon, bearing_deg, distance, right=0.0):
-    b = math.radians(bearing_deg)
-    return offset(lat, lon, distance * math.cos(b) - right * math.sin(b), distance * math.sin(b) + right * math.cos(b))
-
-
-def distance_m(lat1, lon1, lat2, lon2):
-    return math.hypot((lat2 - lat1) * 111320.0, (lon2 - lon1) * 111320.0 * math.cos(math.radians(lat1)))
 
 
 def route_samples(lat, lon, target, region):
@@ -323,8 +309,28 @@ class Camera:
         return np.frombuffer(msg.data, np.uint8).reshape(msg.height, msg.width, 3)
 
 
-def emitter(topic, payload, message='gz.msgs.ParticleEmitter'):
-    subprocess.run(['gz', 'topic', '-t', topic, '-m', message, '-p', payload], check=False, timeout=10)
+class Emitters:
+    """Su ve yangın parçacık yayıcılarının komutları ve tankın boşaltılması. Konular başta bir kez duyurulur, yayın döngüyü
+    bekletmez. Önceden her komut bir 'gz topic' süreci açıyordu: çağrı başına en az 0,86 s (komut satırı aracı yayından
+    önce 800 ms bekler), bırakmada döngü ~1,7 s duruyordu."""
+
+    def __init__(self, node):
+        topics = [WATER_CMD] + [FIRE_CMD.format(name) for name in ('flames', 'dark_smoke', 'smoke_column')]
+        self.pubs = {topic: node.advertise(topic, ParticleEmitter) for topic in topics}
+        self.pubs[WATER_RELEASE] = node.advertise(WATER_RELEASE, Double)
+
+    def emitting(self, topic, on):
+        msg = ParticleEmitter()
+        msg.emitting.data = on
+        self.pubs[topic].publish(msg)
+
+    def rate(self, topic, value):
+        msg = ParticleEmitter()
+        msg.rate.data = value
+        self.pubs[topic].publish(msg)
+
+    def release(self, kg_per_s):
+        self.pubs[WATER_RELEASE].publish(Double(data=kg_per_s))
 
 
 def pattern_items(plan):
@@ -361,32 +367,32 @@ def plan_return(start, course, first_rel, actual_rel=None, at_aircraft=False):
 
 def exit_return(point, course, hold_amsl, actual_amsl):
     """Bırakma sonrası çıkış noktasından piste dönüş, planlayıcının (PB.plan_exit) return_fn'i: (ok, adımlar ve açıklama,
-    gerekçe). Pist yönleri tanımsız dünyada eski denetim (yalnız çıkış noktası çevresinde halka) ve sabit desen."""
-    if RUNWAY_DIRS:
-        plan = plan_return(point, course, hold_amsl - HOME_AMSL, actual_amsl - HOME_AMSL)
-        if not plan.ok:
-            return False, None, '; '.join(f'{n} ({w})' for n, w in plan.rejected)
-        return True, dict(items=pattern_items(plan), text=describe_return(plan)), None
-    ok, first_rel, why = EXIT_RETURN(point, course, hold_amsl, actual_amsl)
-    if not ok:
-        return False, None, why
-    return True, dict(items=fixed_return_items(HOME[0], HOME[1], first_rel), text=f'Piste dönüş: sabit desen, ilk nokta {first_rel:.0f} m'), None
+    gerekçe)."""
+    plan = plan_return(point, course, hold_amsl - HOME_AMSL, actual_amsl - HOME_AMSL)
+    if not plan.ok:
+        return False, None, '; '.join(f'{n} ({w})' for n, w in plan.rejected)
+    return True, dict(items=pattern_items(plan), text=describe_return(plan)), None
 
 
-def return_items(home_lat, home_lon, first_rel=300.0, start=None, course=None, actual_rel=None, at_aircraft=False):
-    """Piste dönüş adımları. start (dönüşün başladığı nokta) ve course (oradaki yön) verilirse ve dünyada iki iniş yönü
-    tanımlıysa desen planlayıcıdan gelir: yolu kısa olan yön, uçağın bulunduğu yerden taban ya da düz giriş; ilk dönüş
-    planlanan yönde ve araziyle denetlenmiş. first_rel ilk dönüşte istenen yükseklik, actual_rel uçağın oradaki gerçek
-    yüksekliği (verilmezse first_rel). Planlayıcı arazi payı tutan aday bulamazsa sabit desen (pistin ötesinden dolaşan)."""
-    if RUNWAY_DIRS and start is not None:
-        plan = plan_return(start, course, first_rel, actual_rel, at_aircraft)
-        if plan.ok:
-            print(describe_return(plan) + (f'; elenen: {"; ".join(f"{n} ({w})" for n, w in plan.rejected)}' if plan.rejected else ''),
-                  flush=True)
-            return pattern_items(plan)
-        print('Piste dönüş: planlayıcı arazi payı tutan desen bulamadı, sabit desen. Nedenler: '
-              + '; '.join(f'{n} ({w})' for n, w in plan.rejected), flush=True)
+def return_items(home_lat, home_lon, first_rel, start, course, actual_rel=None, at_aircraft=False):
+    """Piste dönüş adımları, planlayıcıdan: start (dönüşün başladığı nokta) ve course'tan (oradaki yön) yolu kısa olan
+    iniş yönüne taban ya da düz giriş; ilk dönüş planlanan yönde ve araziyle denetlenmiş. first_rel ilk dönüşte istenen
+    yükseklik, actual_rel uçağın oradaki gerçek yüksekliği (verilmezse first_rel). Planlayıcı arazi payı tutan aday
+    bulamazsa sabit desen (pistin ötesinden dolaşan)."""
+    plan = plan_return(start, course, first_rel, actual_rel, at_aircraft)
+    if plan.ok:
+        print(describe_return(plan) + (f'; elenen: {"; ".join(f"{n} ({w})" for n, w in plan.rejected)}' if plan.rejected else ''),
+              flush=True)
+        return pattern_items(plan)
+    print('Piste dönüş: planlayıcı arazi payı tutan desen bulamadı, sabit desen. Nedenler: '
+          + '; '.join(f'{n} ({w})' for n, w in plan.rejected), flush=True)
     return fixed_return_items(home_lat, home_lon, first_rel)
+
+
+def return_here(s):
+    """Uçağın bulunduğu yerden ve yönünden piste dönüş adımları (s: Vehicle.state)."""
+    return return_items(*HOME, max(RETURN_MIN_REL_M, s['rel']), (s['lat'], s['lon']), math.degrees(s['yaw']) % 360.0,
+                        actual_rel=s['rel'], at_aircraft=True)
 
 
 def fixed_return_items(home_lat, home_lon, first_rel):
@@ -472,10 +478,10 @@ def plan_scan(home, home_amsl, center, bearing, region):
         return None
     scan_rel = max(crest + CRUISE_ABOVE_TERRAIN_M - home_amsl, CLIMB_REL_M)
     items = [dict(name=f'Tarama {k + 1}/{len(points)}', cmd=M.MAV_CMD_NAV_WAYPOINT, lat=point[0], lon=point[1], alt=scan_rel) for k, point in enumerate(points)]
-    return items, max(300.0, max(ground for _, ground in back) + CRUISE_ABOVE_TERRAIN_M - home_amsl)
+    return items, max(RETURN_MIN_REL_M, max(ground for _, ground in back) + CRUISE_ABOVE_TERRAIN_M - home_amsl)
 
 
-def search_items(home_lat, home_lon, search_lat, search_lon, cruise_rel, climb_at=None, scan=None, return_rel=300.0):
+def search_items(home_lat, home_lon, search_lat, search_lon, cruise_rel, climb_at=None, scan=None, return_rel=RETURN_MIN_REL_M):
     climb = [dict(name='Çember atarak tırmanış', cmd=M.MAV_CMD_NAV_LOITER_TO_ALT, lat=climb_at[0], lon=climb_at[1], alt=cruise_rel, radius=CIRCLE_RADIUS_M)] if climb_at else []
     route = [(search_lat, search_lon)] + [(it['lat'], it['lon']) for it in (scan or [])]
     prev = route[-2] if len(route) > 1 else (home_lat, home_lon)
@@ -492,15 +498,15 @@ def climb_items(home_lat, home_lon):
             dict(name='Düz uçuş', cmd=M.MAV_CMD_NAV_WAYPOINT, lat=level_end[0], lon=level_end[1], alt=CLIMB_REL_M)]
 
 
-def attack_mission(target, bearing_deg, run_rel, cruise_rel, exit_plan):
+def attack_mission(target, bearing_deg, run_rel, exit_plan):
     """Su bırakma geçişi, düz çıkış ve piste dönüş. exit_plan: planlayıcının çıkışı (PB.Cikis); dönüş adımları onda."""
     wp = M.MAV_CMD_NAV_WAYPOINT
     run_end = along(target[0], target[1], bearing_deg, WAYPOINT_ACCEPT_M)  # the climb starts over the target, not before it
     return [
         dict(name='Su bırakma geçişi', cmd=wp, lat=run_end[0], lon=run_end[1], alt=run_rel),
-        # irtifa: seyir, uçak oraya yetişemiyorsa yetişebildiği (PX4 irtifası tutmayan noktada döner; planlayıcı)
+        # irtifa: güvenli irtifa (PB.exit_lengths); PX4 noktayı irtifası tutunca bırakır, uçak oraya çıkınca döner
         dict(name='Geçişten çıkış ve tırmanma', cmd=wp, lat=exit_plan.point[0], lon=exit_plan.point[1],
-             alt=min(cruise_rel, exit_plan.point_alt_amsl - HOME_AMSL)),
+             alt=exit_plan.point_alt_amsl - HOME_AMSL),
     ] + exit_plan.ret['items']
 
 
@@ -509,27 +515,14 @@ def strike_items(target, bearing, run_rel, cruise_rel, exit_plan, climb_at=None)
     approach = along(target[0], target[1], bearing, WAYPOINT_ACCEPT_M - COMMIT_RANGE_M)  # the descent starts at COMMIT_RANGE_M, as the planner checks
     climb = [dict(name='Çember atarak tırmanış', cmd=M.MAV_CMD_NAV_LOITER_TO_ALT, lat=climb_at[0], lon=climb_at[1], alt=cruise_rel, radius=CIRCLE_RADIUS_M)] if climb_at else []
     return climb + [dict(name='Yangına yaklaşma', cmd=M.MAV_CMD_NAV_WAYPOINT, lat=approach[0], lon=approach[1], alt=cruise_rel)] + \
-        attack_mission(target, bearing, run_rel, cruise_rel, exit_plan)
+        attack_mission(target, bearing, run_rel, exit_plan)
 
 
 def plan_attack(target, preferred, run_rel, cruise_rel, bearings=None):
-    """Planlayıcıdan su bırakma geçişi (PB): yön, düz çıkış ve oradan araziyle denetlenmiş piste dönüş.
-    bearings verilirse yalnız bu yönler sırayla denenir (düzeltme: yeni yön, olmazsa uçulan yön); verilmezse tercih edilen
-    yöne yakından uzağa. Dönüş: (yön, PB.Cikis) ya da gerekçe metni."""
-    run_amsl, cruise_amsl = HOME_AMSL + run_rel, HOME_AMSL + cruise_rel
-    if bearings is None:
-        plan = PB.plan_run(target, preferred, run_amsl, cruise_amsl, PIST_TERRAIN, exit_return, BIRAKMA_AYAR)
-        if plan.ok:
-            return plan.bearing_deg, plan.exit
-        return '; '.join(f'{b:.0f}°: {w[:160]}' for b, w in plan.rejected[:3])
-    reasons = []
-    for bearing in bearings:
-        exit_plan = PB.plan_exit(target, bearing, run_amsl, cruise_amsl, PIST_TERRAIN, exit_return, BIRAKMA_AYAR)
-        if exit_plan.ok:
-            return bearing, exit_plan
-        reasons.append(f'{bearing:.0f}°: {exit_plan.reason[:160]}')
-    return '; '.join(reasons)
-
+    """Planlayıcıdan su bırakma geçişi (PB.plan_run): yön, düz çıkış ve oradan araziyle denetlenmiş piste dönüş.
+    bearings verilirse yalnız bu yönler sırayla (düzeltme: yeni yön, olmazsa uçulan yön). Dönüş: PB.Gecis."""
+    return PB.plan_run(target, preferred, HOME_AMSL + run_rel, HOME_AMSL + cruise_rel, PIST_TERRAIN, exit_return,
+                       BIRAKMA_AYAR, bearings)
 
 class Estimate:
     """Fire position from terrain intersections. Close, steep views count far more, because the error grows with range squared."""
@@ -547,18 +540,6 @@ class Estimate:
         return float((lat * w).sum() / w.sum()), float((lon * w).sum() / w.sum()), float((a[:, 2] * w).sum() / w.sum())
 
 
-def bearing_deg(lat1, lon1, lat2, lon2):
-    return math.degrees(math.atan2((lon2 - lon1) * math.cos(math.radians(lat1)), lat2 - lat1)) % 360
-
-
-def track_errors(lat, lon, target, bearing):
-    """Along and across track distance of a point from the target; positive along means past it."""
-    n = (lat - target[0]) * 111320.0
-    e = (lon - target[1]) * 111320.0 * math.cos(math.radians(target[0]))
-    b = math.radians(bearing)
-    return n * math.cos(b) + e * math.sin(b), -n * math.sin(b) + e * math.cos(b)
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--search-lat', type=float, help='arama bölgesi; varsayılan dünyaya göre')
@@ -569,7 +550,7 @@ def main():
     ap.add_argument('--timeout', type=float, default=3600.0, help='saniye')
     ap.add_argument('--scoop', action='store_true', help='yangını bulduktan sonra denize inip su al, sonra yangına dön (water_leg.py)')
     ap.add_argument('--offboard-hizalanma', metavar='KAYIT.jsonl', default=None,
-                    help='su bölümünde suya hizalanma ve değiş offboard (otonom.hizalanma; flare PX4 yasa 3, gaz hızı tutar); karar kaydı bu dosyaya')
+                    help='su bölümünde suya hizalanma ve değiş offboard (otonom.hizalanma; flare yasa 6: burun alçalmayı, gaz hızı tutar); karar kaydı bu dosyaya')
     ap.add_argument('--key-start', action='store_true', help='Enter ile arm et, ikinci Enter ile kalk (terminal gerekir)')
     ap.add_argument('--world', default='antalya', help='çalışan Gazebo dünyası; arazi verisi aynı adlı bölgeden okunur')
     ap.add_argument('--sysid', type=int, default=1, help='beklenen PX4 sistem numarası; başkasına komut gönderilmez')
@@ -578,6 +559,8 @@ def main():
     site = SITES.get(args.world)
     if site is None:
         sys.exit(f'"{args.world}" dünyası için pist bilgisi yok: SITES')
+    if not site.get('runway_end') or not site.get('designators'):
+        sys.exit(f'"{args.world}" için pistin öbür başı ve adları (runway_end, designators) tanımlı değil: SITES')
     RUNWAY_HEADING_DEG = site['runway_heading']
     LAND_REL_M = site.get('land_rel', 0.0)
     PATTERN = site.get('pattern', PATTERN)
@@ -590,6 +573,7 @@ def main():
         sys.exit('--key-start terminal ister. Komut gönderilmedi.')
     v = Vehicle(args.url)
     camera = Camera(args.world)
+    emitters = Emitters(camera.node)   # bırakmadan çok önce: abonelerle bağlantı kurulmuş olsun
     # Two simulators can share this machine: nothing is sent until this is known to be the right one.
     if os.environ.get('GZ_PARTITION'):
         sys.exit(f'GZ_PARTITION={os.environ["GZ_PARTITION"]} ayarlı; bu senaryo varsayılan Gazebo bölümü için. Komut gönderilmedi.')
@@ -611,47 +595,45 @@ def main():
     home = (s['lat'], s['lon'])
     home_amsl = s['alt']
     search_point = (args.search_lat, args.search_lon)
-    global RUNWAY_DIRS, PIST_AYAR, PIST_TERRAIN, HOME_AMSL, HOME, EXIT_RETURN
+    global RUNWAY_DIRS, PIST_AYAR, PIST_TERRAIN, HOME_AMSL, HOME
     root = data_root_dir()
     gh = lambda la, lo: float(ground_height(root, args.world, la, lo))  # noqa: E731
     HOME, HOME_AMSL = home, home_amsl
     PIST_TERRAIN = SG.OnbellekliArazi(gh)
-    # Pist yönleri tanımsız dünya: bırakma sonrası eski dönüş denetimi (çıkış çevresinde halka) ve sabit desen
-    EXIT_RETURN = PB.ring_return(PIST_TERRAIN, along(*home, RUNWAY_HEADING_DEG, RETURN_ALONG_M, PATTERN['right']), home_amsl,
-                                 EXIT_TURN_CLEAR_M, 300.0, CRUISE_ABOVE_TERRAIN_M, BIRAKMA_AYAR)
-    if site.get('runway_end'):
-        # İki iniş yönü (planlayıcı yolu kısa olanı seçer). İlk yön kalkış yönü, eşik kalkış noktası; öbür yönün eşiği
-        # pistin öbür başı, iniş noktası yüksekliği arazi farkıyla. İlk dönüş boş uçağın hızıyla (dönüşler genelde boş).
-        # Dönüşün PX4 sınırları parametrelerden (kullanıcı 2026-11-27); yerde okunur, okunamazsa kalkılmaz.
-        px4 = {name: read_param(v, name) for name in ('NAV_FW_ALT_RAD', 'FW_T_SINK_MAX', 'FW_R_LIM')}
-        missing = [name for name, value in px4.items() if value is None]
-        if missing:
-            sys.exit(f'PX4 parametreleri okunamadı: {", ".join(missing)}. Kalkılmadı.')
-        PIST_AYAR = PL.PistAyar(land_along_m=LAND_ALONG_M, final_m=-PATTERN['base'], base_m=PATTERN['right'],
-                                pattern_rel_m=PATTERN['rel'], final_angle_deg=PATTERN.get('final_angle', 2.99),
-                                turn_radius_m=CIRCLE_RADIUS_M, margin_m=ROUTE_MIN_MARGIN_M, airspeed=EMPTY_SPEED_MPS,
-                                bank_deg=px4['FW_R_LIM'], accept_m=WAYPOINT_ACCEPT_M, corridor_m=WAYPOINT_ACCEPT_M + 60.0,
-                                climb_gradient=CLIMB_RATE_MPS / CRUISE_SPEED_MPS,
-                                sink_max_gradient=px4['FW_T_SINK_MAX'] / EMPTY_SPEED_MPS,
-                                descent_max_gradient=0.8 * px4['FW_T_SINK_MAX'] / EMPTY_SPEED_MPS,
-                                alt_accept_m=px4['NAV_FW_ALT_RAD'])
-        print(f"Dönüş planı PX4 sınırları: NAV_FW_ALT_RAD {px4['NAV_FW_ALT_RAD']:g} m, FW_T_SINK_MAX {px4['FW_T_SINK_MAX']:g} m/s, "
-              f"FW_R_LIM {px4['FW_R_LIM']:g}°", flush=True)
-        back_heading = (RUNWAY_HEADING_DEG + 180.0) % 360.0
-        land_fwd = along(*home, RUNWAY_HEADING_DEG, LAND_ALONG_M)
-        land_back = along(*site['runway_end'], back_heading, LAND_ALONG_M)
-        names = site.get('designators', ('ileri', 'geri'))
-        RUNWAY_DIRS = [PL.PistYonu(names[0], home, RUNWAY_HEADING_DEG, LAND_REL_M),
-                       PL.PistYonu(names[1], tuple(site['runway_end']), back_heading,
-                                   LAND_REL_M + gh(*land_back) - gh(*land_fwd))]
-        print(f'Pist yönleri: {names[0]} ({RUNWAY_HEADING_DEG:.0f}°), {names[1]} ({back_heading:.0f}°, iniş noktası '
-              f'{RUNWAY_DIRS[1].land_rel_m:+.2f} m); dönüşte yolu kısa olan seçilir', flush=True)
+    # İki iniş yönü (planlayıcı yolu kısa olanı seçer). İlk yön kalkış yönü, eşik kalkış noktası; öbür yönün eşiği
+    # pistin öbür başı, iniş noktası yüksekliği arazi farkıyla. İlk dönüş boş uçağın hızıyla (dönüşler genelde boş).
+    # Dönüşün PX4 sınırları parametrelerden (kullanıcı 2026-11-27); yerde okunur, okunamazsa kalkılmaz.
+    try:
+        px4 = R.read_px4_params(lambda name: read_param(v, name), ('NAV_FW_ALT_RAD', 'FW_T_SINK_MAX', 'FW_R_LIM'))
+    except RuntimeError as error:
+        sys.exit(f'{error}. Kalkılmadı.')
+    PIST_AYAR = PL.PistAyar(land_along_m=LAND_ALONG_M, final_m=-PATTERN['base'], base_m=PATTERN['right'],
+                            pattern_rel_m=PATTERN['rel'], final_angle_deg=PATTERN.get('final_angle', 2.99),
+                            turn_radius_m=CIRCLE_RADIUS_M, margin_m=ROUTE_MIN_MARGIN_M, airspeed=EMPTY_SPEED_MPS,
+                            bank_deg=px4['FW_R_LIM'], accept_m=WAYPOINT_ACCEPT_M, corridor_m=RETURN_CORRIDOR_M,
+                            climb_gradient=CLIMB_RATE_MPS / CRUISE_SPEED_MPS,
+                            sink_max_gradient=px4['FW_T_SINK_MAX'] / EMPTY_SPEED_MPS,
+                            descent_max_gradient=0.8 * px4['FW_T_SINK_MAX'] / EMPTY_SPEED_MPS,
+                            alt_accept_m=px4['NAV_FW_ALT_RAD'])
+    print(f"Dönüş planı PX4 sınırları: NAV_FW_ALT_RAD {px4['NAV_FW_ALT_RAD']:g} m, FW_T_SINK_MAX {px4['FW_T_SINK_MAX']:g} m/s, "
+          f"FW_R_LIM {px4['FW_R_LIM']:g}°", flush=True)
+    back_heading = (RUNWAY_HEADING_DEG + 180.0) % 360.0
+    land_fwd = along(*home, RUNWAY_HEADING_DEG, LAND_ALONG_M)
+    land_back = along(*site['runway_end'], back_heading, LAND_ALONG_M)
+    names = site['designators']
+    RUNWAY_DIRS = [PL.PistYonu(names[0], home, RUNWAY_HEADING_DEG, LAND_REL_M),
+                   PL.PistYonu(names[1], tuple(site['runway_end']), back_heading,
+                               LAND_REL_M + gh(*land_back) - gh(*land_fwd))]
+    print(f'Pist yönleri: {names[0]} ({RUNWAY_HEADING_DEG:.0f}°), {names[1]} ({back_heading:.0f}°, iniş noktası '
+          f'{RUNWAY_DIRS[1].land_rel_m:+.2f} m); dönüşte yolu kısa olan seçilir', flush=True)
     # Checked on the ground: a missing terrain must stop the mission before takeoff, not during it.
     plan = plan_search(*home, home_amsl + TAKEOFF_REL_M, search_point, args.world)
     if plan is None:
         sys.exit(f'"{args.world}" bölgesinin arazi verisi bu rotada yok ({data_root_dir()}). Kalkılmadı.')
     print(f'Rotadaki en yüksek arazi {plan["crest"]:.0f} m, seyir {plan["cruise"]:.0f} m (deniz seviyesinden)', flush=True)
     cruise_rel = plan['cruise'] - home_amsl
+    # Aramanın başladığı yer: su alan görevde kalkış yönündeki düz tırmanışın sonu, öbüründe kalkış noktası
+    start, start_amsl, items = home, home_amsl + TAKEOFF_REL_M, [takeoff_item(*home)]
     if args.scoop:
         samples = route_samples(*home, along(*home, RUNWAY_HEADING_DEG, LEVEL_END_M), args.world)
         if samples is None:
@@ -665,36 +647,19 @@ def main():
         water_leg.WATER_DIR = os.path.join(data_root_dir(), args.world, 'water')
         water_leg.GROUND_ROLL_HEADING_DEG = RUNWAY_HEADING_DEG
         water_leg.LAND_REL_M = LAND_REL_M
-        level_end = along(*home, RUNWAY_HEADING_DEG, LEVEL_END_M)
-        via = site.get('search_via')
-        first = via or search_point
-        plan = plan_search(*level_end, home_amsl + CLIMB_REL_M, first, args.world)
-        last = plan_search(*via, home_amsl + CLIMB_REL_M, search_point, args.world) if via else plan
-        if plan is None or last is None:
+        start, start_amsl, items = along(*home, RUNWAY_HEADING_DEG, LEVEL_END_M), home_amsl + CLIMB_REL_M, climb_items(*home)
+        plan = plan_search(*start, start_amsl, search_point, args.world)
+        if plan is None:
             sys.exit(f'"{args.world}" bölgesinin arazi verisi arama rotasında yok. Kalkılmadı.')
-        if plan['climb_first'] and not plan['safe']:
-            sys.exit(f'Arama rotasında arazi payı yetersiz ({plan["margin"]:.0f} m). Kalkılmadı.')
-        if plan['climb_first'] and not circle_clear(level_end, CIRCLE_RADIUS_M, home_amsl + CLIMB_REL_M, args.world):
-            sys.exit(f'Tırmanış çemberinde {CIRCLE_RADIUS_M:.0f} m yarıçapta arazi payı yok. Kalkılmadı.')
-        cruise_rel = max(plan['cruise'], last['cruise']) - home_amsl
-        cruise_rel = max(cruise_rel, CLIMB_REL_M)
-        items = climb_items(*home)
-        if via:
-            items.append(dict(name='Arama hattına geçiş', cmd=M.MAV_CMD_NAV_WAYPOINT, lat=via[0], lon=via[1], alt=cruise_rel))
-        scan_plan = plan_scan(home, home_amsl, search_point, bearing_deg(*first, *search_point) if via else bearing_deg(*level_end, *search_point), args.world)
-        if scan_plan is None:
-            print('UYARI: tarama alanının arazi verisi yok, yangın bulunamazsa tarama yapılmadan dönülecek', flush=True)
-        items += search_items(*home, *search_point, cruise_rel, level_end if plan['climb_first'] else None, *(scan_plan or ()))
-    else:
-        climb_at = home if plan['climb_first'] else None
-        if plan['climb_first'] and not plan['safe']:
-            sys.exit(f'Rotada arazi payı yetersiz ({plan["margin"]:.0f} m) ve tırmanış için güvenli alan yok. Kalkılmadı.')
-        if plan['climb_first'] and not circle_clear(home, CIRCLE_RADIUS_M, home_amsl + TAKEOFF_REL_M, args.world):
-            sys.exit(f'Tırmanış çemberinde {CIRCLE_RADIUS_M:.0f} m yarıçapta arazi payı yok. Kalkılmadı.')
-        scan_plan = plan_scan(home, home_amsl, search_point, bearing_deg(*home, *search_point), args.world)
-        if scan_plan is None:
-            print('UYARI: tarama alanının arazi verisi yok, yangın bulunamazsa tarama yapılmadan dönülecek', flush=True)
-        items = [takeoff_item(*home)] + search_items(*home, *search_point, cruise_rel, climb_at, *(scan_plan or ()))
+        cruise_rel = max(plan['cruise'] - home_amsl, CLIMB_REL_M)
+    if plan['climb_first'] and not plan['safe']:
+        sys.exit(f'Arama rotasında arazi payı yetersiz ({plan["margin"]:.0f} m) ve tırmanış için güvenli alan yok. Kalkılmadı.')
+    if plan['climb_first'] and not circle_clear(start, CIRCLE_RADIUS_M, start_amsl, args.world):
+        sys.exit(f'Tırmanış çemberinde {CIRCLE_RADIUS_M:.0f} m yarıçapta arazi payı yok. Kalkılmadı.')
+    scan_plan = plan_scan(home, home_amsl, search_point, bearing_deg(*start, *search_point), args.world)
+    if scan_plan is None:
+        print('UYARI: tarama alanının arazi verisi yok, yangın bulunamazsa tarama yapılmadan dönülecek', flush=True)
+    items += search_items(*home, *search_point, cruise_rel, start if plan['climb_first'] else None, *(scan_plan or ()))
     v.upload(items)
     print(f'Görev yüklendi: {len(items)} adım', flush=True)
 
@@ -841,9 +806,8 @@ def main():
                         # 100 m; alçalış payı koruyabildiği ilk noktada; su küçükse irtifa karada çemberde kaybedilir.
                         transit_rel = max(cruise_rel, transit['cruise'] - home_amsl)
                         entry_amsl = water_map.height + water_leg.APPROACH_ABOVE_WATER_M
-                        terrain = SG.OnbellekliArazi(lambda la, lo: float(ground_height(data_root_dir(), args.world, la, lo)))
                         gecis = SG.plan_water_transit((s['lat'], s['lon']), home_amsl + transit_rel, entry, route[2], entry_amsl,
-                                                      terrain, water_map.is_water, SU_GECIS_AYAR)
+                                                      PIST_TERRAIN, water_map.is_water, SU_GECIS_AYAR)
                         if not gecis.ok:
                             leg = dict(ok=False, reason=f'su geçişi planlanamadı: {gecis.reason}')
                     if gecis is not None and gecis.ok:
@@ -856,7 +820,7 @@ def main():
                             if 'radius' in it:  # su bacağı devralacak: çember irtifaya inince bitsin, teğet bekleme yok
                                 it['param1'] = 0
                                 it.pop('param4', None)
-                        upload_in_flight(v, transit_items + return_items(*home, 300.0, entry, route[2], actual_rel=entry_amsl - home_amsl))
+                        upload_in_flight(v, transit_items + return_items(*home, RETURN_MIN_REL_M, entry, route[2], actual_rel=entry_amsl - home_amsl))
                         v.update(2)
                         while s['seq'] < len(transit_items) and s['armed'] and time.time() - t0 < args.timeout:
                             v.update(0.2)
@@ -885,42 +849,29 @@ def main():
                     elif strike is not None and strike['climb_first'] and not circle_clear((s['lat'], s['lon']), CIRCLE_RADIUS_M, s['alt'], args.world):
                         why = f'tırmanış çemberinde {CIRCLE_RADIUS_M:.0f} m yarıçapta arazi payı yok'
                         strike = None
-                    if strike is None:
-                        searching = False
-                        target = None
-                        items = return_items(*home, max(300.0, s['rel']), (s['lat'], s['lon']), math.degrees(s.get('yaw', 0.0)) % 360.0,
-                                             actual_rel=s['rel'], at_aircraft=True)
-                        print(f'{stamp()} Yangına gidilmiyor: {why}. Piste dönülüyor', flush=True)
-                    else:
+                    attack = None
+                    if strike is not None:
                         # Exit point depends on the water, so the run is planned from where the aircraft is now.
                         cruise_rel = strike['cruise'] - home_amsl
                         attack = plan_attack(target, bearing_deg(s['lat'], s['lon'], target[0], target[1]), run_rel, cruise_rel)
-                        if isinstance(attack, str):
-                            searching = False
-                            target = None
-                            items = return_items(*home, max(300.0, s['rel']), (s['lat'], s['lon']), math.degrees(s.get('yaw', 0.0)) % 360.0,
-                                                 actual_rel=s['rel'], at_aircraft=True)
-                            print(f'{stamp()} Yangına gidilmiyor: su bırakma için yaklaşması, çıkışı ve piste dönüşü güvenli yön yok '
-                                  f'({attack}). Piste dönülüyor', flush=True)
-                        else:
-                            run_bearing, exit_plan = attack
-                            items = strike_items(target, run_bearing, run_rel, cruise_rel, exit_plan, (s['lat'], s['lon']) if strike['climb_first'] else None)
-                            print(f'{stamp()} Su alındı, yangına gidiliyor. Yön {run_bearing:.0f}°, seyir {strike["cruise"]:.0f} m, '
-                                  f'bırakma sonrası düz {exit_plan.exit_m:.0f} m' + ('. Önce çember atarak tırmanılacak' if strike['climb_first'] else ''), flush=True)
-                            print(f'{stamp()} {exit_plan.ret["text"]}', flush=True)
+                    if attack is not None and attack.ok:
+                        run_bearing, exit_plan = attack.bearing_deg, attack.exit
+                        items = strike_items(target, run_bearing, run_rel, cruise_rel, exit_plan, (s['lat'], s['lon']) if strike['climb_first'] else None)
+                        print(f'{stamp()} Su alındı, yangına gidiliyor. Yön {run_bearing:.0f}°, seyir {strike["cruise"]:.0f} m, '
+                              f'bırakma sonrası düz {exit_plan.exit_m:.0f} m' + ('. Önce çember atarak tırmanılacak' if strike['climb_first'] else ''), flush=True)
+                        print(f'{stamp()} {exit_plan.ret["text"]}', flush=True)
                 else:
                     attack = plan_attack(target, run_bearing, run_rel, cruise_rel)
-                    if isinstance(attack, str):
-                        searching = False
-                        target = None
-                        items = return_items(*home, max(300.0, s['rel']), (s['lat'], s['lon']), math.degrees(s.get('yaw', 0.0)) % 360.0,
-                                             actual_rel=s['rel'], at_aircraft=True)
-                        print(f'{stamp()} Yangına gidilmiyor: su bırakma için yaklaşması, çıkışı ve piste dönüşü güvenli yön yok '
-                              f'({attack}). Piste dönülüyor', flush=True)
-                    else:
-                        run_bearing, exit_plan = attack
-                        items = attack_mission(target, run_bearing, run_rel, cruise_rel, exit_plan)
+                    if attack.ok:
+                        run_bearing, exit_plan = attack.bearing_deg, attack.exit
+                        items = attack_mission(target, run_bearing, run_rel, exit_plan)
                         print(f'{stamp()} Yön {run_bearing:.0f}°, bırakma sonrası düz {exit_plan.exit_m:.0f} m. {exit_plan.ret["text"]}', flush=True)
+                if attack is None or not attack.ok:
+                    if attack is not None:
+                        why = f'su bırakma için yaklaşması, çıkışı ve piste dönüşü güvenli yön yok ({attack.reason})'
+                    searching, target = False, None
+                    items = return_here(s)
+                    print(f'{stamp()} Yangına gidilmiyor: {why}. Piste dönülüyor', flush=True)
                 upload_in_flight(v, items)
                 current = -1
             elif target is not None and released is None:
@@ -936,13 +887,13 @@ def main():
                         err = distance_m(target[0], target[1], args.fire_lat, args.fire_lon)
                         new_bearing = bearing_deg(s['lat'], s['lon'], target[0], target[1])
                         attack = plan_attack(target, new_bearing, run_rel, cruise_rel, bearings=(new_bearing, run_bearing))
-                        if isinstance(attack, str):
-                            print(f'{stamp()} Rota güncellenmedi: düzeltilen hatta güvenli çıkış ya da dönüş yok ({attack}). '
+                        if not attack.ok:
+                            print(f'{stamp()} Rota güncellenmedi: düzeltilen hatta güvenli çıkış ya da dönüş yok ({attack.reason}). '
                                   f'Hesap hatası {err:.0f} m', flush=True)
                         else:
                             aimed = target[:2]
-                            run_bearing, exit_plan = attack
-                            items = attack_mission(target, run_bearing, run_rel, cruise_rel, exit_plan)
+                            run_bearing, exit_plan = attack.bearing_deg, attack.exit
+                            items = attack_mission(target, run_bearing, run_rel, exit_plan)
                             v.upload(items)
                             v.link.mav.mission_set_current_send(v.link.target_system, v.link.target_component, 0)
                             current = -1
@@ -956,15 +907,15 @@ def main():
                 released = time.time()
                 err = distance_m(target[0], target[1], args.fire_lat, args.fire_lon)
                 print(f'{stamp()} SU BIRAKILIYOR: yerden ~{s["alt"] - target[2]:.0f} m, hat dışı {across_m:.0f} m. Son hesap hatası {err:.0f} m.', flush=True)
-                emitter(WATER_CMD, 'emitting: {data: true}')
+                emitters.emitting(WATER_CMD, True)
                 # The tank empties in the physics too (WaterPhysics water/release, kg/s), a little faster than the curtain
-                emitter(WATER_RELEASE, f'data: {WATER_RELEASE_KGS}', 'gz.msgs.Double')
+                emitters.release(WATER_RELEASE_KGS)
             if released is not None and release_end is None:
                 points.append((s['lat'], s['lon']))
                 if time.time() - released >= RELEASE_S:
                     release_end = time.time()
-                    emitter(WATER_CMD, 'emitting: {data: false}')
-                    emitter(WATER_RELEASE, 'data: 0', 'gz.msgs.Double')
+                    emitters.emitting(WATER_CMD, False)
+                    emitters.release(0.0)
                     mid = points[len(points) // 2]
                     miss_along, miss_across = track_errors(args.fire_lat, args.fire_lon, mid, run_bearing)
                     hit = abs(miss_along) <= HIT_ALONG_M and abs(miss_across) <= HIT_ACROSS_M
@@ -973,9 +924,9 @@ def main():
         if effect_time and time.time() >= effect_time:
             effect_time = None
             if hit:
-                emitter(FIRE_CMD.format('flames'), 'emitting: {data: false}')
-                emitter(FIRE_CMD.format('dark_smoke'), 'emitting: {data: false}')
-                emitter(FIRE_CMD.format('smoke_column'), 'rate: {data: 2}')
+                emitters.emitting(FIRE_CMD.format('flames'), False)
+                emitters.emitting(FIRE_CMD.format('dark_smoke'), False)
+                emitters.rate(FIRE_CMD.format('smoke_column'), 2.0)
                 print(f'{stamp()} İSABET: alev söndü, koyu duman kesildi.', flush=True)
             else:
                 print(f'{stamp()} ISKA: yangın yanmaya devam ediyor.', flush=True)

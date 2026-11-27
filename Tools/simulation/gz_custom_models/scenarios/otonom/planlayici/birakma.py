@@ -4,14 +4,17 @@ nasıl dönülür.
 fire_attack.py'deki plan_run ve plan_exit buraya taşındı (2026-11-27; kural: plan kuralları planlayıcıda). Kurallar:
 - Yaklaşma: geçiş yönünde commit_range_m geriden, seyir irtifasından bırakma irtifasına doğrusal alçalış; her örnekte
   yerden en az margin_m.
-- Düz çıkış: bırakmadan sonra exit_runs_m uzunluklarıyla düz ve tırmanarak. İrtifa PX4'ün uçacağı gibi (climb_profile):
-  bırakma geçişi noktası hedefin accept_m ötesindedir; istenen irtifa o noktadan sonra çıkış noktasına accept_m kala
-  noktanın irtifasına doğrusal yükselir, uçak en çok climb_gradient ile tırmanır. Her örnekte yerden en az margin_m.
-  Çıkış noktasının irtifası seyirdir, uçak oraya yetişemiyorsa yetişebildiği: PX4 noktayı irtifa farkı NAV_FW_ALT_RAD
-  içinde değilse bırakmaz ve orada kendi seçtiği yönde döner.
+- Düz çıkış (kullanıcı kararı 2026-11-27, yangın söndürme uçaklarındaki gibi): bırakmadan sonra düz ve tırmanarak,
+  güvenli irtifaya tırmanmaya yetecek kadar. Güvenli irtifa yereldir: çıkış yolunun ve dönüş alanının en yüksek
+  arazisinin safe_above_m üstü, seyirden yüksek değil (exit_lengths); uzaktaki bir sırt için gereken irtifaya dönüş
+  yolunda tırmanılır. Dönüş tutmazsa çıkış exit_step_m adımlarla exit_max_m'ye kadar uzar. İrtifa PX4'ün uçacağı gibi
+  (climb_profile): bırakma geçişi noktası hedefin accept_m ötesindedir; istenen irtifa o noktadan sonra çıkış noktasına
+  accept_m kala noktanın irtifasına doğrusal yükselir, uçak en çok climb_gradient ile tırmanır. Her örnekte yerden en az
+  margin_m. Çıkış noktasının irtifası güvenli irtifadır: PX4 noktayı irtifa farkı NAV_FW_ALT_RAD içinde değilse
+  bırakmaz, yani uçak güvenli irtifaya çıkmadan dönmez.
 - Dönüş: çıkış noktasından piste dönüş return_fn ile, uçağın dönüş başındaki (çıkış noktasına accept_m kala) tahmini
-  irtifasıyla denetlenir. Dalaman'da return_fn pist.plan_runway_return'dür: ilk dönüş Dubins yolu, iki yanda koridor, PX4'ün
-  noktayı erken bırakması. Dönüş yoksa daha kısa çıkış, o da yoksa başka geçiş yönü (tercih edilen yöne yakından uzağa)
+  irtifasıyla denetlenir. return_fn pist.plan_runway_return'dür (fire_attack): ilk dönüş Dubins yolu, iki yanda koridor, PX4'ün
+  noktayı erken bırakması. Dönüş yoksa daha uzun çıkış, o da yoksa başka geçiş yönü (tercih edilen yöne yakından uzağa)
   denenir.
 2026-11-27 gösterisinde çıkıştan sonraki ~180° dönüş denetlenmiyordu (yalnız çıkış noktası çevresinde 500 m halka);
 uçak kısa yönden döndü ve sırta çarptı.
@@ -22,20 +25,10 @@ return_fn(nokta, yön, istenen irtifa amsl, gerçek irtifa amsl) -> (ok, dönü�
 import math
 from dataclasses import dataclass, field
 
-__all__ = ['BirakmaAyar', 'Cikis', 'Gecis', 'climb_profile', 'plan_exit', 'plan_run', 'ring_return']
+from . import rota as R
+from .geo import along, distance_m
 
-R_EARTH_LAT = 111320.0
-
-
-def _along(lat, lon, bearing_deg, distance, right=0.0):
-    b = math.radians(bearing_deg)
-    north, east = distance * math.cos(b) - right * math.sin(b), distance * math.sin(b) + right * math.cos(b)
-    return lat + north / R_EARTH_LAT, lon + east / (R_EARTH_LAT * math.cos(math.radians(lat)))
-
-
-def _dist(a, b):
-    return math.hypot((b[0] - a[0]) * R_EARTH_LAT, (b[1] - a[1]) * R_EARTH_LAT * math.cos(math.radians(a[0])))
-
+__all__ = ['BirakmaAyar', 'Cikis', 'Gecis', 'climb_profile', 'exit_lengths', 'plan_exit', 'plan_run']
 
 @dataclass(frozen=True)
 class BirakmaAyar:
@@ -44,7 +37,11 @@ class BirakmaAyar:
     margin_m: float = 50.0              # ROUTE_MIN_MARGIN_M
     step_m: float = 100.0               # ROUTE_STEP_M
     climb_gradient: float = 3.45 / 45.0  # ölçülen seyir tırmanışı (m/m)
-    exit_runs_m: tuple = (3000.0, 2500.0, 2000.0, 1500.0, 1000.0)
+    safe_above_m: float = 200.0         # güvenli irtifa yerel arazinin bu kadar üstü (CRUISE_ABOVE_TERRAIN_M)
+    safe_width_m: float = 500.0         # yerel arazi: çıkış yolunun iki yanında ve ötesinde (dönüş koridoru)
+    safe_step_m: float = 30.0           # yerel arazi enine bu aralıkla (dönüş koridoru gibi: seyrek örnek dar tepeyi kaçırır)
+    exit_step_m: float = 250.0          # dönüş tutmazsa düz çıkış bu adımlarla uzar
+    exit_max_m: float = 3000.0          # düz çıkış dönüş için en çok bu kadar uzar
     max_offset_deg: int = 90            # geçiş yönü tercih edilenden en çok bu kadar sapar
     offset_step_deg: int = 10
 
@@ -55,7 +52,7 @@ class Cikis:
     exit_m: float = None
     point: tuple = None                 # çıkış noktası (lat, lon)
     alt_amsl: float = None              # dönüş başında (çıkış noktasına accept_m kala) beklenen irtifa
-    point_alt_amsl: float = None        # çıkış noktasının görev irtifası: seyir, uçak yetişemiyorsa yetişebildiği
+    point_alt_amsl: float = None        # çıkış noktasının görev irtifası: güvenli irtifa
     ret: object = None                  # return_fn'in döndürdüğü dönüş planı
     reason: str = None
     rejected: list = field(default_factory=list)   # [(uzunluk, gerekçe)]
@@ -70,7 +67,7 @@ class Gecis:
     rejected: list = field(default_factory=list)   # [(yön, gerekçe)]
 
 
-def climb_profile(x, exit_m, run_amsl, cruise_amsl, ayar=BirakmaAyar()):
+def climb_profile(x, exit_m, run_amsl, point_amsl, ayar=BirakmaAyar()):
     """Hedeften x metre ötede (geçiş yönünde) PX4'ün uçacağı irtifa, deniz seviyesine göre.
 
     Uçak hedefte bırakma geçişi noktasını (hedef + accept_m) bırakıp çıkış noktasına yönelir. İki nokta arasında PX4
@@ -79,24 +76,22 @@ def climb_profile(x, exit_m, run_amsl, cruise_amsl, ayar=BirakmaAyar()):
     a = ayar.accept_m
     if exit_m - a > a:
         start = a
-        sp = run_amsl + (cruise_amsl - run_amsl) * min(1.0, max(0.0, (x - a) / (exit_m - 2.0 * a)))
+        sp = run_amsl + (point_amsl - run_amsl) * min(1.0, max(0.0, (x - a) / (exit_m - 2.0 * a)))
     else:
         start = 0.0
-        sp = cruise_amsl
-    if cruise_amsl <= run_amsl:
-        return sp
+        sp = point_amsl
     return min(sp, run_amsl + ayar.climb_gradient * max(0.0, x - start))
 
 
-def _run_clear(target, bearing_deg, exit_m, run_amsl, cruise_amsl, terrain, ayar):
+def _run_clear(target, bearing_deg, exit_m, run_amsl, point_amsl, terrain, ayar):
     """Bırakmadan çıkış noktasına düz yol: her örnekte yerden en az margin_m. Sorun yoksa None, varsa gerekçe."""
     steps = max(1, int(exit_m / ayar.step_m))
     for i in range(1, steps + 1):
         x = exit_m * i / steps
-        ground = terrain(*_along(target[0], target[1], bearing_deg, x))
+        ground = terrain(*along(target[0], target[1], bearing_deg, x))
         if ground is None:
             return 'arazi verisi yok'
-        z = climb_profile(x, exit_m, run_amsl, cruise_amsl, ayar)
+        z = climb_profile(x, exit_m, run_amsl, point_amsl, ayar)
         if ground + ayar.margin_m > z:
             return f'düz çıkışın {x:.0f}. m\'sinde arazi {ground:.0f} m, yükseklik {z:.0f} m'
     return None
@@ -104,8 +99,8 @@ def _run_clear(target, bearing_deg, exit_m, run_amsl, cruise_amsl, terrain, ayar
 
 def _approach_clear(target, bearing_deg, run_amsl, cruise_amsl, terrain, ayar):
     """Yaklaşma: commit_range_m geriden seyir irtifasından hedefte bırakma irtifasına doğrusal. None ya da gerekçe."""
-    start = _along(target[0], target[1], bearing_deg, -ayar.commit_range_m)
-    length = _dist(start, target)
+    start = along(target[0], target[1], bearing_deg, -ayar.commit_range_m)
+    length = distance_m(start[0], start[1], target[0], target[1])
     steps = max(1, int(length / ayar.step_m))
     for i in range(1, steps + 1):
         k = i / steps
@@ -118,37 +113,67 @@ def _approach_clear(target, bearing_deg, run_amsl, cruise_amsl, terrain, ayar):
     return None
 
 
+def exit_lengths(target, bearing_deg, run_amsl, cruise_amsl, terrain, ayar=BirakmaAyar()):
+    """Denenecek düz çıkışlar kısadan uzuna, gerektikçe: (hedeften uzunluk, güvenli irtifa); arazi verisi biterse durur.
+
+    Güvenli irtifa: düz çıkış yolunun ve dönüş alanının (yolun iki yanında ve çıkış noktasının ötesinde safe_width_m,
+    rota.corridor_max) en yüksek arazisinin safe_above_m üstü, seyirden yüksek, bırakma irtifasından düşük değil
+    (bırakmadan sonra alçalış yok). İlk uzunluk uçağın güvenli irtifaya yetiştiği en kısa uzunluk (step_m katı, en az
+    2 * accept_m; tırmanış climb_profile'daki gibi). Sonrakiler exit_step_m adımlarla exit_max_m'ye kadar, güvenli
+    irtifaya yetişilenler. Güvenli irtifa seyri aşmadığından ilk uzunluk her zaman bulunur."""
+    frame, step = R.YerelCerceve(target[0], target[1]), ayar.step_m
+    tops = []       # tops[i]: hedeften i * step_m'ye kadar yolun iki yanındaki en yüksek arazi
+    length, found = math.ceil(2.0 * ayar.accept_m / step) * step, False
+    while not found or length <= ayar.exit_max_m:
+        k = math.ceil((length + ayar.safe_width_m) / step)
+        while len(tops) <= k:
+            x, y = frame.xy(*along(target[0], target[1], bearing_deg, len(tops) * step))
+            top = R.corridor_max(terrain, frame, x, y, bearing_deg, ayar.safe_width_m, ayar.safe_step_m)
+            if top is None:
+                return
+            tops.append(max(tops[-1], top) if tops else top)
+        alt = max(run_amsl, min(cruise_amsl, tops[k] + ayar.safe_above_m))
+        if climb_profile(length, length, run_amsl, alt, ayar) >= alt - 1e-6:
+            found = True
+            yield length, alt
+        length += ayar.exit_step_m if found else step
+
+
 def plan_exit(target, bearing_deg, run_amsl, cruise_amsl, terrain, return_fn, ayar=BirakmaAyar()):
-    """Bırakmadan sonra en uzun güvenli düz çıkış ve oradan piste dönüş.
+    """Bırakmadan sonra güvenli irtifaya tırmanmaya yeten en kısa düz çıkış (exit_lengths) ve oradan piste dönüş.
 
     target: (lat, lon[, ...]) hedef; bearing_deg: geçiş yönü; run_amsl: bırakma irtifası; cruise_amsl: çıkışta istenen
-    seyir irtifası. Dönüş: Cikis. Düz yol ya da dönüş hiçbir uzunlukta tutmazsa ok False, rejected her uzunluğun gerekçesi."""
+    seyir irtifası. Dönüş: Cikis. Düz yol ya da dönüş hiçbir uzunlukta tutmazsa ok False, rejected her uzunluğun gerekçesi
+    (arazi verisi yoksa boş)."""
     rejected = []
-    for exit_m in ayar.exit_runs_m:
-        # PX4 çıkış noktasını irtifa farkı NAV_FW_ALT_RAD içinde değilse bırakmaz, orada döner: noktanın irtifası uçağın
-        # oraya kadar tırmanabileceğini aşmaz (tırmanış bırakma geçişi noktasını geçince başlar)
-        point_alt = min(cruise_amsl, run_amsl + ayar.climb_gradient * max(0.0, exit_m - ayar.accept_m))
+    for exit_m, point_alt in exit_lengths(target, bearing_deg, run_amsl, cruise_amsl, terrain, ayar):
+        # noktanın irtifası güvenli irtifa, uçak oraya bu uzunlukta yetişir: PX4 noktayı irtifa farkı NAV_FW_ALT_RAD
+        # içinde değilse bırakmaz, yani uçak güvenli irtifaya çıkmadan dönmez
         why = _run_clear(target, bearing_deg, exit_m, run_amsl, point_alt, terrain, ayar)
         if why:
             rejected.append((exit_m, why))
             continue
-        point = _along(target[0], target[1], bearing_deg, exit_m)
+        point = along(target[0], target[1], bearing_deg, exit_m)
         alt = climb_profile(exit_m - ayar.accept_m, exit_m, run_amsl, point_alt, ayar)
         ok, ret, why = return_fn(point, bearing_deg, cruise_amsl, alt)
         if not ok:
             rejected.append((exit_m, f'dönüş: {why}'))
             continue
         return Cikis(True, exit_m, point, alt, point_alt, ret, rejected=rejected)
-    return Cikis(False, reason='; '.join(f'{m:.0f} m: {w}' for m, w in rejected), rejected=rejected)
+    return Cikis(False, reason='; '.join(f'{m:.0f} m: {w}' for m, w in rejected) or 'arazi verisi yok', rejected=rejected)
 
 
-def plan_run(target, preferred_deg, run_amsl, cruise_amsl, terrain, return_fn, ayar=BirakmaAyar()):
-    """Tercih edilen yöne en yakın, yaklaşması, düz çıkışı ve piste dönüşü güvenli geçiş yönü. Dönüş: Gecis."""
+def plan_run(target, preferred_deg, run_amsl, cruise_amsl, terrain, return_fn, ayar=BirakmaAyar(), bearings=None):
+    """Tercih edilen yöne en yakın, yaklaşması, düz çıkışı ve piste dönüşü güvenli geçiş yönü. Dönüş: Gecis; reason ilk
+    üç elenen yönün kısa gerekçesi. bearings verilirse yalnız bu yönler sırayla denenir ve yaklaşma denetlenmez
+    (bırakmaya yaklaşırken düzeltme: yeni yön, olmazsa uçulan yön; uçak zaten yaklaşmada)."""
+    check_approach = bearings is None
+    if check_approach:
+        offsets = sorted(range(-ayar.max_offset_deg, ayar.max_offset_deg + 1, ayar.offset_step_deg), key=abs)
+        bearings = [(preferred_deg + offset) % 360.0 for offset in offsets]
     rejected = []
-    step = ayar.offset_step_deg
-    for offset in sorted(range(-ayar.max_offset_deg, ayar.max_offset_deg + 1, step), key=abs):
-        bearing = (preferred_deg + offset) % 360.0
-        why = _approach_clear(target, bearing, run_amsl, cruise_amsl, terrain, ayar)
+    for bearing in bearings:
+        why = _approach_clear(target, bearing, run_amsl, cruise_amsl, terrain, ayar) if check_approach else None
         if why:
             rejected.append((bearing, why))
             continue
@@ -156,27 +181,4 @@ def plan_run(target, preferred_deg, run_amsl, cruise_amsl, terrain, return_fn, a
         if exit_plan.ok:
             return Gecis(True, bearing, exit_plan, rejected=rejected)
         rejected.append((bearing, exit_plan.reason))
-    return Gecis(False, reason=f'{len(rejected)} yönün hiçbiri tutmadı', rejected=rejected)
-
-
-def ring_return(terrain, return_point, home_amsl, ring_m=500.0, min_rel_m=300.0, above_terrain_m=200.0,
-                ayar=BirakmaAyar()):
-    """Pist yönleri tanımsız dünyalar (sabit dönüş deseni) için eski dönüş denetimi, return_fn olarak.
-
-    Çıkış noktası çevresinde ring_m halkada (30° aralık) arazi + margin_m istenen irtifanın altında kalmalı; dönüşün ilk
-    noktasının yüksekliği (kalkış noktasına göre) yol üstündeki arazinin above_terrain_m üstü, en az min_rel_m. Dönüş
-    yönünü ve yayını denetlemez. Plan olarak bu yüksekliği döner."""
-    def check(point, course_deg, hold_amsl, actual_amsl):
-        ring = [terrain(*_along(point[0], point[1], b, ring_m)) for b in range(0, 360, 30)]
-        if any(h is None for h in ring):
-            return False, None, 'arazi verisi yok'
-        if max(ring) + ayar.margin_m > hold_amsl:
-            return False, None, f'dönüş halkasında arazi {max(ring):.0f} m'
-        length = _dist(point, return_point)
-        steps = max(1, int(length / ayar.step_m))
-        back = [terrain(point[0] + (return_point[0] - point[0]) * i / steps, point[1] + (return_point[1] - point[1]) * i / steps)
-                for i in range(1, steps + 1)]
-        if any(h is None for h in back):
-            return False, None, 'arazi verisi yok'
-        return True, max(min_rel_m, max(back) + above_terrain_m - home_amsl), None
-    return check
+    return Gecis(False, reason='; '.join(f'{b:.0f}°: {w[:160]}' for b, w in rejected[:3]), rejected=rejected)
